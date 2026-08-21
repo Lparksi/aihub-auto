@@ -466,6 +466,16 @@ export class RouteDaemon {
 		});
 	}
 
+	private effectiveRateForGroup(
+		items: readonly GroupStat[],
+		groupId: number,
+	): number | undefined {
+		const stat = items.find((item) => item.groupId === groupId);
+		if (!stat) return undefined;
+		const rate = this.userRates?.get(groupId) ?? stat.rateMultiplier;
+		return Number.isFinite(rate) && rate >= 0 ? rate : undefined;
+	}
+
 	private async routeSingle(
 		request: RouteRequest,
 	): Promise<ActiveKey | undefined> {
@@ -483,9 +493,18 @@ export class RouteDaemon {
 			this.hardEligible(lockedGroupId, items, blocked, now) &&
 			this.deps.breaker.allowRequest(lockedGroupId, now)
 		) {
-			if (current?.groupId === lockedGroupId) return current;
+			if (current?.groupId === lockedGroupId) {
+				return {
+					...current,
+					effectiveRate: this.effectiveRateForGroup(items, lockedGroupId),
+				};
+			}
 			try {
-				return await this.deps.executor.switchTo(lockedGroupId);
+				const key = await this.deps.executor.switchTo(lockedGroupId);
+				return {
+					...key,
+					effectiveRate: this.effectiveRateForGroup(items, lockedGroupId),
+				};
 			} catch (err) {
 				this.deps.breaker.releaseRequest(lockedGroupId, now);
 				throw err;
@@ -496,7 +515,10 @@ export class RouteDaemon {
 			this.hardEligible(current.groupId, items, blocked, now) &&
 			this.deps.breaker.allowRequest(current.groupId, now)
 		) {
-			return current;
+			return {
+				...current,
+				effectiveRate: this.effectiveRateForGroup(items, current.groupId),
+			};
 		}
 
 		for (;;) {
@@ -510,7 +532,11 @@ export class RouteDaemon {
 				continue;
 			}
 			try {
-				return await this.deps.executor.switchTo(target.stat.groupId);
+				const key = await this.deps.executor.switchTo(target.stat.groupId);
+				return {
+					...key,
+					effectiveRate: this.effectiveRateForGroup(items, target.stat.groupId),
+				};
 			} catch (err) {
 				this.deps.breaker.releaseRequest(target.stat.groupId, now);
 				throw err;
@@ -553,6 +579,7 @@ export class RouteDaemon {
 				request,
 				previousGroupId,
 				now,
+				this.effectiveRateForGroup(items, affinityGroupId),
 			);
 		}
 
@@ -568,13 +595,20 @@ export class RouteDaemon {
 				request,
 				previousGroupId,
 				now,
+				this.effectiveRateForGroup(items, lockedGroupId),
 			);
 		}
 
 		const blocked = new Set(failed);
 		const probe = this.halfOpenProbe(items, blocked, now, request.sessionKey);
 		if (probe !== undefined && this.deps.breaker.allowRequest(probe, now)) {
-			return this.prepareRequestKey(probe, request, previousGroupId, now);
+			return this.prepareRequestKey(
+				probe,
+				request,
+				previousGroupId,
+				now,
+				this.effectiveRateForGroup(items, probe),
+			);
 		}
 
 		let target: ScoredCandidate | undefined;
@@ -598,7 +632,13 @@ export class RouteDaemon {
 			}
 			groupId = fallback;
 		}
-		return this.prepareRequestKey(groupId, request, previousGroupId, now);
+		return this.prepareRequestKey(
+			groupId,
+			request,
+			previousGroupId,
+			now,
+			this.effectiveRateForGroup(items, groupId),
+		);
 	}
 
 	private async routingItems(model?: string): Promise<GroupStat[]> {
@@ -678,6 +718,7 @@ export class RouteDaemon {
 		request: RouteRequest,
 		_previousGroupId: number | undefined,
 		now: number,
+		effectiveRate?: number,
 	): Promise<ActiveKey> {
 		const releasePending = this.deps.traffic.reserve(groupId);
 		let key: ActiveKey;
@@ -698,7 +739,7 @@ export class RouteDaemon {
 			request.updateBinding === false ||
 			request.preferredGroupId !== undefined
 		) {
-			return { ...key, release };
+			return { ...key, release, effectiveRate };
 		}
 		const binding = this.deps.affinity.bindForRoute(
 			request.sessionKey,
@@ -708,6 +749,7 @@ export class RouteDaemon {
 		return {
 			...key,
 			release,
+			effectiveRate,
 			rollback: binding.rollback,
 			invalidate: binding.invalidate,
 			isCurrentBinding: binding.isCurrent,

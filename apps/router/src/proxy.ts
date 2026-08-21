@@ -37,6 +37,7 @@ const MAX_ERROR_BYTES = 16 * 1024;
 const MAX_RESPONSE_ID_BYTES = 16 * 1024;
 const MAX_USAGE_BYTES = 64 * 1024;
 const LOCAL_RESPONSE_HEADER = "x-aihub-auto-local-response";
+const ROUTE_RATE_HEADER = "x-aihub-auto-rate";
 
 interface ByteReader {
 	read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -148,7 +149,12 @@ function downstreamHeaders(source: Headers, groupId: number): Headers {
 	const headers = new Headers();
 	source.forEach((value, name) => {
 		const lower = name.toLowerCase();
-		if (!HOP_BY_HOP.has(lower) && lower !== "content-encoding") {
+		if (
+			!HOP_BY_HOP.has(lower) &&
+			lower !== "content-encoding" &&
+			lower !== "x-aihub-auto-group" &&
+			lower !== ROUTE_RATE_HEADER
+		) {
 			headers.set(name, value);
 		}
 	});
@@ -636,6 +642,9 @@ async function handleProxyRequest(
 			active.rollback = undefined;
 
 			const outHeaders = downstreamHeaders(response.headers, groupId);
+			if (active.effectiveRate !== undefined) {
+				outHeaders.set(ROUTE_RATE_HEADER, String(active.effectiveRate));
+			}
 
 			let sawFirstByte = false;
 			let outcomeRecorded = false;

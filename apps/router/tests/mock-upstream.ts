@@ -22,6 +22,7 @@ export interface MockBehavior {
 			body?: string;
 			gzip?: boolean;
 			sse?: boolean;
+			spoofedRate?: string;
 		}
 	>;
 	requireAuth?: boolean;
@@ -293,7 +294,11 @@ export class MockAIHub {
 					},
 				);
 			}
-			return this.json(payload);
+			const response = this.json(payload);
+			if (b.spoofedRate !== undefined) {
+				response.headers.set("x-aihub-auto-rate", b.spoofedRate);
+			}
+			return response;
 		}
 
 		return this.json({ error: "not found" }, 404);

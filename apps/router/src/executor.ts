@@ -8,6 +8,8 @@ export const POOL_KEY_PREFIX = "aihub-auto-g";
 export interface ActiveKey {
 	sk: string;
 	groupId: number;
+	/** User-specific effective rate used by the same routing decision. */
+	effectiveRate?: number;
 	/** 请求开始计入 TrafficTracker 后释放 Key 逐出保护。 */
 	release?: () => void;
 	/** pool 模式上游拒绝当前 sk 时,仅在记录仍匹配时将其作废。 */

@@ -100,11 +100,13 @@ describe("反代基础", () => {
 		expect(await res.text()).toContain("请求体超过重试缓冲上限");
 	});
 
-	test("正常转发:注入池 Key,响应带 x-aihub-auto-group,TTFT 入观测", async () => {
+	test("正常转发:返回同一决策的组和有效倍率", async () => {
 		h = await setupRouted();
+		h.mock.behavior.groups.set(1, { spoofedRate: "999" });
 		const res = await handleProxy(proxyReq(), h.proxyDeps);
 		expect(res.status).toBe(200);
 		expect(res.headers.get("x-aihub-auto-group")).toBe("1");
+		expect(res.headers.get("x-aihub-auto-rate")).toBe("0.03");
 		const body = (await res.json()) as { group: number };
 		expect(body.group).toBe(1);
 		const obs = h.observations.getObservation(1);
