@@ -115,6 +115,7 @@ const HOP_BY_HOP = new Set([
 	"content-length",
 	"authorization",
 	"x-api-key",
+	"x-sub2api-max-rate",
 	LOCAL_RESPONSE_HEADER,
 ]);
 
@@ -416,9 +417,17 @@ async function handleProxyRequest(
 		}
 	}
 
-	const context = requestRoutingContext(path, req.headers, body, (responseId) =>
-		deps.affinity.resolveResponse(responseId),
-	);
+	const rawMaxRate = req.headers.get("x-sub2api-max-rate")?.trim();
+	const maxRate = rawMaxRate === undefined || rawMaxRate === "" ? undefined : Number(rawMaxRate);
+	if (maxRate !== undefined && (!Number.isFinite(maxRate) || maxRate < 0)) {
+		return errorResponse(400, "请求价格上限无效");
+	}
+	const context = {
+		...requestRoutingContext(path, req.headers, body, (responseId) =>
+			deps.affinity.resolveResponse(responseId),
+		),
+		maxRate,
+	};
 	let active: ActiveKey | undefined;
 	try {
 		active = await deps.route(context);

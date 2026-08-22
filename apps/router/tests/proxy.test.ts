@@ -115,6 +115,39 @@ describe("反代基础", () => {
 		expect(obs!.errorRate).toBe(0);
 	});
 
+	test("请求价格上限在上游请求前过滤超价分组", async () => {
+		h = await setupRouted();
+		const res = await handleProxy(
+			proxyReq("/v1/chat/completions", {
+				headers: {
+					"Content-Type": "application/json",
+					"x-sub2api-max-rate": "0.04",
+				},
+			}),
+			h.proxyDeps,
+		);
+		expect(res.status).toBe(200);
+		expect(res.headers.get("x-aihub-auto-group")).toBe("1");
+		const upstream = h.mock.requestLog.filter((r) => r.path.startsWith("/v1/"));
+		expect(upstream.at(-1)?.path).toBe("/v1/chat/completions");
+	});
+
+	test("没有低于价格上限的分组时不访问上游并返回可重试失败", async () => {
+		h = await setupRouted();
+		const before = h.mock.requestLog.filter((r) => r.path.startsWith("/v1/")).length;
+		const res = await handleProxy(
+			proxyReq("/v1/chat/completions", {
+				headers: {
+					"Content-Type": "application/json",
+					"x-sub2api-max-rate": "0.01",
+				},
+			}),
+			h.proxyDeps,
+		);
+		expect(res.status).toBe(503);
+		expect(h.mock.requestLog.filter((r) => r.path.startsWith("/v1/")).length).toBe(before);
+	});
+
 	test("上游 gzip 自动解压后移除编码头,客户端不二次解压", async () => {
 		h = await setupRouted();
 		h.mock.behavior.groups.set(1, { gzip: true });

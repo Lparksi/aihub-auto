@@ -310,6 +310,10 @@ export async function handleControl(
 				});
 			}
 		}
+		const suggestedGroupId = round?.decision.targetGroupId ?? deps.state.currentGroupId;
+		const suggestedCandidate = suggestedGroupId === undefined
+			? undefined
+			: candidates.find((candidate) => candidate.groupId === suggestedGroupId);
 		const affinity = deps.proxyDeps.affinity.stats(now);
 		const cacheProtectedGroups = deps.proxyDeps.affinity.protectedGroupIds(
 			deps.config.decision.cacheIdleMs,
@@ -401,6 +405,9 @@ export async function handleControl(
 		return json({
 			currentGroupId: deps.state.currentGroupId ?? null,
 			currentCode: currentCode ?? null,
+			suggestedGroupId: suggestedGroupId ?? null,
+			suggestedCode: suggestedCandidate?.code ?? null,
+			suggestedRate: suggestedCandidate?.rate ?? null,
 			config: {
 				listen: deps.config.listen,
 				proxyAuthRequired: Boolean(deps.config.proxyToken),

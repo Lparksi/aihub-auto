@@ -55,6 +55,8 @@ export interface RoundResult {
 export interface RouteRequest {
 	sessionKey?: string;
 	model?: string;
+	/** Server-supplied effective-rate ceiling for relay requests. */
+	maxRate?: number;
 	preferredGroupId?: number;
 	cacheEvidence?: boolean;
 	continuity?: boolean;
@@ -480,7 +482,7 @@ export class RouteDaemon {
 		request: RouteRequest,
 	): Promise<ActiveKey | undefined> {
 		const now = Date.now();
-		const items = await this.routingItems(request.model);
+		const items = this.applyMaxRate(await this.routingItems(request.model), request.maxRate);
 		const blocked = new Set(request.failedGroupIds ?? []);
 		for (const groupId of this.modelBlockedGroupIds(request.model, now)) {
 			blocked.add(groupId);
@@ -548,7 +550,7 @@ export class RouteDaemon {
 		request: RouteRequest,
 	): Promise<ActiveKey | undefined> {
 		const now = Date.now();
-		const items = await this.routingItems(request.model);
+		const items = this.applyMaxRate(await this.routingItems(request.model), request.maxRate);
 		const failed = new Set(request.failedGroupIds ?? []);
 		for (const groupId of this.modelBlockedGroupIds(request.model, now)) {
 			failed.add(groupId);
@@ -639,6 +641,14 @@ export class RouteDaemon {
 			now,
 			this.effectiveRateForGroup(items, groupId),
 		);
+	}
+
+	private applyMaxRate(items: GroupStat[], maxRate?: number): GroupStat[] {
+		if (maxRate === undefined) return items;
+		return items.filter((item) => {
+			const rate = this.userRates?.get(item.groupId) ?? item.rateMultiplier;
+			return Number.isFinite(rate) && rate <= maxRate + 1e-9;
+		});
 	}
 
 	private async routingItems(model?: string): Promise<GroupStat[]> {
