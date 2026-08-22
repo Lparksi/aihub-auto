@@ -34,6 +34,7 @@ import {
 	initRouterSentry,
 	syncSentryUser,
 } from "./sentry.ts";
+import { ManagedAccountRouter } from "./multi.ts";
 
 function upstreamProxy(config: AppConfig): string | undefined {
 	if (config.outboundProxyMode === "custom") return config.outboundProxyUrl;
@@ -290,6 +291,28 @@ async function main(): Promise<void> {
 		fetch: fetchUpstream,
 	};
 
+	const isMultiChild = process.env["AIHUB_AUTO_MULTI_CHILD"] === "1";
+	const script = process.argv[1]?.endsWith(".ts") || process.argv[1]?.endsWith(".js")
+		? process.argv[1]
+		: undefined;
+	const childEnv = { ...process.env };
+	if (!childEnv.AIHUB_AUTO_UI_PASSWORD && config.uiPassword) {
+		childEnv.AIHUB_AUTO_UI_PASSWORD = config.uiPassword;
+	}
+	if (!childEnv.AIHUB_AUTO_PROXY_TOKEN && config.proxyToken) {
+		childEnv.AIHUB_AUTO_PROXY_TOKEN = config.proxyToken;
+	}
+	const accountRouter = isMultiChild
+		? undefined
+		: new ManagedAccountRouter(
+				dir,
+				process.execPath,
+				script,
+				childEnv,
+				logger,
+			);
+	if (accountRouter) await accountRouter.load();
+
 	let server: ReturnType<typeof createServer>;
 	try {
 		server = createServer({
@@ -308,6 +331,7 @@ async function main(): Promise<void> {
 			sentryDsn,
 			desktopMode: process.env["AIHUB_AUTO_DESKTOP"] === "1",
 			syncSentryUser,
+			accountRouter,
 		});
 	} catch (err) {
 		logger.error(
@@ -359,6 +383,7 @@ async function main(): Promise<void> {
 		if (persistTimer) clearTimeout(persistTimer);
 		daemon.stop();
 		server.stop(true);
+		await accountRouter?.close();
 		if (config.keyMode === "pool" && config.cleanupPoolOnExit) {
 			await executor.cleanup().catch(() => {});
 		}

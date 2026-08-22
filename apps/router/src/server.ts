@@ -8,6 +8,7 @@ import { handleProxy, type ProxyDeps } from "./proxy.ts";
 import { redact, type Logger } from "./logger.ts";
 import { captureRouterException } from "./sentry.ts";
 import { renderUi } from "./ui.ts";
+import type { ManagedAccountRouter } from "./multi.ts";
 
 export interface ServerDeps {
 	config: AppConfig;
@@ -27,6 +28,8 @@ export interface ServerDeps {
 	/** 由 Tauri desktop sidecar 启动;否则为 standalone 无头路由器。 */
 	desktopMode: boolean;
 	syncSentryUser: (email?: string) => void;
+	/** Optional account multiplexer for station-scoped AIHub runtimes. */
+	accountRouter?: ManagedAccountRouter;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -159,6 +162,14 @@ export async function handleControl(
 		return json({ error: "需要控制台口令(x-ui-password)" }, 401);
 	}
 	const path = url.pathname;
+
+	if (path === "/ctl/accounts" && req.method === "GET") {
+		return json({ accounts: deps.accountRouter?.list() ?? [] });
+	}
+	if (deps.accountRouter) {
+		const routed = await deps.accountRouter.routeControl(req, url);
+		if (routed) return routed;
+	}
 
 	if (path === "/ctl/logs" && req.method === "GET") {
 		const rawLimit = url.searchParams.get("limit") ?? "500";
@@ -706,6 +717,10 @@ export function createServer(deps: ServerDeps): ReturnType<typeof Bun.serve> {
 				);
 			}
 			// 其余全部按上游 API 反代
+			if (deps.accountRouter) {
+				const routed = await deps.accountRouter.routeProxy(req, url);
+				if (routed) return routed;
+			}
 			return handleProxy(req, deps.proxyDeps);
 		},
 		error: (err) => {
