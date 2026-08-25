@@ -53,6 +53,84 @@ describe("守护循环", () => {
 		).toBe("unavailable_group");
 	});
 
+	test("有缓存线索的新会话偏向云端缓存命中率更高的组", async () => {
+		h = createHarness({ configPatch: { keyMode: "pool" } });
+		h.mock.stats = [
+			makeStat({
+				groupId: 1,
+				rateMultiplier: 0.05,
+				avgTtftMs: 1000,
+				cloudCacheHitRate: 0.1,
+			}),
+			makeStat({
+				groupId: 2,
+				rateMultiplier: 0.05,
+				avgTtftMs: 1000,
+				cloudCacheHitRate: 0.95,
+			}),
+		];
+		await h.daemon.runOnce();
+		const key = await h.daemon.route({
+			sessionKey: "cache-preferring-session",
+			cacheEvidence: true,
+		});
+		try {
+			expect(key?.groupId).toBe(2);
+		} finally {
+			key?.release?.();
+		}
+	});
+
+	test("没有缓存线索时忽略渠道缓存命中率", async () => {
+		h = createHarness({ configPatch: { keyMode: "pool" } });
+		h.mock.stats = [
+			makeStat({
+				groupId: 1,
+				rateMultiplier: 0.05,
+				avgTtftMs: 900,
+				cloudCacheHitRate: 0.1,
+			}),
+			makeStat({
+				groupId: 2,
+				rateMultiplier: 0.05,
+				avgTtftMs: 1000,
+				cloudCacheHitRate: 0.95,
+			}),
+		];
+		await h.daemon.runOnce();
+		const key = await h.daemon.route({ sessionKey: "no-cache-evidence" });
+		try {
+			expect(key?.groupId).toBe(1);
+		} finally {
+			key?.release?.();
+		}
+	});
+
+	test("没有会话键时不使用渠道缓存先验", async () => {
+		h = createHarness({ configPatch: { keyMode: "pool" } });
+		h.mock.stats = [
+			makeStat({
+				groupId: 1,
+				rateMultiplier: 0.05,
+				avgTtftMs: 900,
+				cloudCacheHitRate: 0.1,
+			}),
+			makeStat({
+				groupId: 2,
+				rateMultiplier: 0.05,
+				avgTtftMs: 1000,
+				cloudCacheHitRate: 0.95,
+			}),
+		];
+		await h.daemon.runOnce();
+		const key = await h.daemon.route({ cacheEvidence: true });
+		try {
+			expect(key?.groupId).toBe(1);
+		} finally {
+			key?.release?.();
+		}
+	});
+
 	test("统计拉取失败:容忍并用上轮缓存(标 stale)", async () => {
 		h = createHarness({ configPatch: { keyMode: "pool" } });
 		h.mock.stats = [makeStat({ groupId: 1 })];

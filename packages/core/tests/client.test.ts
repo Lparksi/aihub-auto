@@ -124,6 +124,8 @@ describe("AIHubClient.getProviderLatencyStats", () => {
 								user_sample_count: 50,
 								user_has_data: true,
 								models: ["gpt-5", "gpt-5-mini"],
+								cache_hit_rate: "88.03%",
+								success_rates: { "5m": 0.96, "6h": 0.91 },
 							},
 							{
 								group_id: 4,
@@ -133,6 +135,14 @@ describe("AIHubClient.getProviderLatencyStats", () => {
 								user_avg_ttft_ms: 0,
 								user_sample_count: 0,
 								user_has_data: false,
+							},
+							{
+								group_id: 6,
+								platform: "openai",
+								available: true,
+								probe_e2e_ttft_ms: 900,
+								cache_hit_rate: "-",
+								success_rates: { "6h": "0.75" },
 							},
 							{
 								group_id: 5,
@@ -157,6 +167,9 @@ describe("AIHubClient.getProviderLatencyStats", () => {
 			userSampleCount: 50,
 			supportedModels: ["gpt-5", "gpt-5-mini"],
 			modelAvailabilityKnown: true,
+			cloudCacheHitRate: 0.8803,
+			cloudSuccessRate5m: 0.96,
+			cloudSuccessRate6h: 0.91,
 		});
 		expect(providers.get(4)).toEqual({
 			groupId: 4,
@@ -169,6 +182,17 @@ describe("AIHubClient.getProviderLatencyStats", () => {
 		expect(providers.get(5)).toEqual(
 			expect.objectContaining({ available: true, cloudProbeTtftMs: 700 }),
 		);
+		expect(providers.get(6)).toEqual({
+			groupId: 6,
+			platform: "openai",
+			available: true,
+			cloudProbeTtftMs: 900,
+			userAvgTtftMs: undefined,
+			userSampleCount: 0,
+			cloudCacheHitRate: undefined,
+			cloudSuccessRate5m: undefined,
+			cloudSuccessRate6h: 0.75,
+		});
 	});
 });
 

@@ -13,6 +13,7 @@ import {
 	type ScoringOptions,
 	decide,
 	evaluate,
+	cacheUtilityBonus,
 	mergeProviderLatencies,
 } from "@aihub-auto/core";
 import { randomUUID } from "node:crypto";
@@ -569,6 +570,11 @@ export class RouteDaemon {
 			: undefined;
 		const affinityGroupId = request.preferredGroupId ?? previousGroupId;
 		const preserveBinding = Boolean(request.continuity || cacheLikelyHot);
+			// 渠道命中率只用于没有本地会话事实的新缓存会话。已有绑定即使
+			// 缓存已冷却/观测为 miss,也不应被聚合先验再次牵引到另一组。
+			const preferCloudCache =
+				Boolean(request.sessionKey && request.cacheEvidence) &&
+				affinityGroupId === undefined;
 
 		if (
 			preserveBinding &&
@@ -616,7 +622,11 @@ export class RouteDaemon {
 		let target: ScoredCandidate | undefined;
 		for (;;) {
 			const evaluation = this.evaluate(items, now, [...blocked]);
-			target = this.selectP2c(evaluation, request.sessionKey ?? randomUUID());
+			target = this.selectP2c(
+				evaluation,
+				request.sessionKey ?? randomUUID(),
+				preferCloudCache,
+			);
 			if (!target) break;
 			if (this.deps.breaker.allowRequest(target.stat.groupId, now)) break;
 			blocked.add(target.stat.groupId);
@@ -769,6 +779,7 @@ export class RouteDaemon {
 	private selectP2c(
 		evaluation: Evaluation,
 		seed: string,
+		preferCloudCache = false,
 	): ScoredCandidate | undefined {
 		// 请求调度使用显式池上限,不复用 Koishi 展示用的 scoreWindow。
 		// 否则健康容量会在负载计算前被永久排除。
@@ -792,7 +803,12 @@ export class RouteDaemon {
 			const pending = active[String(candidate.stat.groupId)] ?? 0;
 			// 静态评分与负载评分共享同一对数效用:
 			// log(latency * (pending + 1)) = log(latency) + log(pending + 1)。
-			return candidate.score - latencyWeight * Math.log(pending + 1);
+			const cacheBonus = cacheUtilityBonus(
+				this.deps.config.mode,
+				candidate.cloudCacheHitRate,
+				preferCloudCache,
+			);
+			return candidate.score - latencyWeight * Math.log(pending + 1) + cacheBonus;
 		};
 		const firstScore = adjustedScore(first);
 		const secondScore = adjustedScore(second);

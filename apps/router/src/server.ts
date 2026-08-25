@@ -219,6 +219,9 @@ export async function handleControl(
 			localSamples?: number;
 			successRate?: number;
 			outcomeSamples?: number;
+			cloudSuccessRate?: number;
+			cloudReliabilityWeight?: number;
+			cloudCacheHitRate?: number;
 			score?: number | string;
 			standby?: boolean;
 			excluded: boolean;
@@ -248,6 +251,9 @@ export async function handleControl(
 					localSamples: c.localSampleCount,
 					successRate: Number(c.successRate.toFixed(3)),
 					outcomeSamples: c.outcomeSampleCount,
+					cloudSuccessRate: c.cloudSuccessRate,
+					cloudReliabilityWeight: Number(c.cloudReliabilityWeight.toFixed(3)),
+					cloudCacheHitRate: c.cloudCacheHitRate,
 					score: Number.isFinite(c.score) ? c.score : String(c.score),
 					excluded: false,
 					forceable: true,
@@ -275,6 +281,9 @@ export async function handleControl(
 					localSamples: c.localSampleCount,
 					successRate: Number(c.successRate.toFixed(3)),
 					outcomeSamples: c.outcomeSampleCount,
+					cloudSuccessRate: c.cloudSuccessRate,
+					cloudReliabilityWeight: Number(c.cloudReliabilityWeight.toFixed(3)),
+					cloudCacheHitRate: c.cloudCacheHitRate,
 					score: Number.isFinite(c.score) ? c.score : String(c.score),
 					standby: true,
 					excluded: false,
@@ -315,6 +324,11 @@ export async function handleControl(
 						? Number(e.evidence.successRate.toFixed(3))
 						: undefined,
 					outcomeSamples: e.evidence?.outcomeSampleCount,
+					cloudSuccessRate: e.evidence?.cloudSuccessRate,
+					cloudReliabilityWeight: e.evidence
+						? Number(e.evidence.cloudReliabilityWeight.toFixed(3))
+						: undefined,
+					cloudCacheHitRate: e.evidence?.cloudCacheHitRate,
 					excluded: true,
 					excludeReason: e.excludeReason,
 					forceable: MANUAL_LOCK_OVERRIDE_REASONS.has(e.excludeReason),

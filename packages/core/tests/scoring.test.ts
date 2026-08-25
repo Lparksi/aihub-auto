@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { evaluate, recommendTopN } from "../src/index.ts";
+import { cacheUtilityBonus, evaluate, recommendTopN } from "../src/index.ts";
 import type { GroupStat, LocalObservation } from "../src/index.ts";
 import { NOW, opts, stat } from "./helpers.ts";
 
@@ -146,6 +146,13 @@ describe("硬过滤", () => {
 });
 
 describe("评分与模式", () => {
+	test("缓存效用只在有缓存线索时生效,并按模式延迟权重缩放", () => {
+		expect(cacheUtilityBonus("economy", 1, false)).toBe(0);
+		expect(cacheUtilityBonus("economy", 1, true)).toBeCloseTo(0.05, 6);
+		expect(cacheUtilityBonus("balanced", 0.8, true)).toBeCloseTo(0.1, 6);
+		expect(cacheUtilityBonus("speed", 2, true)).toBeCloseTo(0.2, 6);
+		expect(cacheUtilityBonus("speed", undefined, true)).toBe(0);
+	});
 	// 便宜慢组 vs 贵快组;快组足够快时,旧版 economy 也会选它。
 	const cheap = stat({ groupId: 1, rateMultiplier: 0.02, avgTtftMs: 5000 });
 	const fast = stat({ groupId: 2, rateMultiplier: 0.08, avgTtftMs: 200 });
@@ -446,6 +453,44 @@ describe("评分与模式", () => {
 		expect(candidate.userTtftMs).toBe(3000);
 		expect(candidate.upstreamTtftMs).toBe(3000);
 		expect(candidate.blendedTtftMs).toBe(3000);
+	});
+
+	test("冷启动将云端成功率作为受限失败风险先验，本地结果建立后自动衰减", () => {
+		const cold = evaluate(
+			[
+				stat({
+					groupId: 1,
+					avgTtftMs: 1000,
+					cloudSuccessRate5m: 0.2,
+				}),
+			],
+			opts(),
+		).eligible[0]!;
+		expect(cold.cloudSuccessRate).toBe(0.2);
+		expect(cold.cloudReliabilityWeight).toBeCloseTo(0.25, 6);
+		expect(cold.errorRate).toBeCloseTo(0.2, 6);
+		expect(cold.conservativeLatencyMs).toBeCloseTo(1250, 6);
+
+		const warm = evaluate(
+			[stat({ groupId: 1, avgTtftMs: 1000, cloudSuccessRate5m: 0.2 })],
+			opts(),
+			new Map([
+				[
+					1,
+					{
+						groupId: 1,
+						ewmaTtftMs: 1000,
+						errorRate: 0,
+						sampleCount: 10,
+						outcomeConfidence: 1,
+						lastAt: NOW,
+						confidence: 1,
+					},
+				],
+			]),
+		).eligible[0]!;
+		expect(warm.cloudReliabilityWeight).toBe(0);
+		expect(warm.errorRate).toBe(0);
 	});
 
 	test("本地 TTFT 为零样本时完全忽略本地延迟", () => {

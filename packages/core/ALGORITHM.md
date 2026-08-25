@@ -131,6 +131,15 @@ loadedLatency = conservativeLatency * (activeByGroup + pendingByGroup + 1)
 loadedScore   = score - latencyWeight * ln(activeByGroup + pendingByGroup + 1)
 ```
 
+当请求带有 `prompt_cache_key` 或稳定提示前缀等缓存线索时,再加入渠道级 `cache_hit_rate` 的先验效用:
+
+```text
+cacheBonus = latencyWeight * 0.25 * clamp01(cache_hit_rate)
+loadedScore += cacheBonus
+```
+
+其中 `0.25` 是最大缓存效用上限,会随 `economy`/`balanced`/`speed` 的延迟权重缩放;没有缓存线索或接口返回 `"-"` 时加分为零。它只影响新请求的冷启动挑战者选择,已有会话仍按本地缓存命中/未命中和会话亲和回到原组。
+
 负载惩罚不再收敛到固定下限,所以任意有限价格候选在相对积压足够高时都能接管流量。这里的计数是连续负载量,同一个分组可以同时承担多个请求,不会被当成单槽资源。等权候选用会话哈希拆分。`economy` 候选仍严格限制在当前最低价层,负载不会单独触发加价;`balanced`/`speed` 按各自权重比较。会话绑定后不做动态迁移。
 
 ## 8. 故障、熔断与模型能力

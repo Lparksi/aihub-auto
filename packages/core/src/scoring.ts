@@ -1,5 +1,6 @@
 import {
 	DEFAULT_ECONOMY_POLICY,
+	DEFAULT_CACHE_UTILITY_MAX,
 	DEFAULT_SCORE_WINDOW,
 	DEFAULT_TOPN_MAX,
 	MIN_CONFIDENCE,
@@ -53,6 +54,24 @@ function geometricMean(values: readonly number[]): number | undefined {
 }
 
 /**
+ * 为带缓存线索的新请求计算缓存效用。
+ *
+ * cache_hit_rate 是渠道聚合概率，不是当前会话的事实命中结果，因此只在
+ * 冷启动且请求确实携带稳定提示/缓存键时生效，并按模式的延迟权重缩放。
+ */
+export function cacheUtilityBonus(
+	mode: ScoringOptions["mode"],
+	cacheHitRate: number | undefined,
+	cacheEvidence: boolean,
+): number {
+	if (!cacheEvidence || cacheHitRate === undefined || !Number.isFinite(cacheHitRate)) {
+		return 0;
+	}
+	const hitRate = clamp01(cacheHitRate);
+	return MODE_WEIGHTS[mode].latencyWeight * DEFAULT_CACHE_UTILITY_MAX * hitRate;
+}
+
+/**
  * 硬约束 + 官网用户/云端探测/本地三源对数融合 + 失败/尾延迟风险修正。
  * 缺失来源不占权重;本地证据按实时置信度逐步接管上游基线。
  */
@@ -84,6 +103,9 @@ export function evaluate(
 		outcomeSampleCount: number;
 		successRate: number;
 		errorRate: number;
+		cloudCacheHitRate?: number;
+		cloudSuccessRate?: number;
+		cloudReliabilityWeight: number;
 		confidence: number;
 		blendedTtftMs: number;
 		conservativeLatencyMs: number;
@@ -104,6 +126,9 @@ export function evaluate(
 			localSampleCount: candidate.localSampleCount,
 			outcomeSampleCount: candidate.outcomeSampleCount,
 			successRate: candidate.successRate,
+			cloudCacheHitRate: candidate.cloudCacheHitRate,
+			cloudSuccessRate: candidate.cloudSuccessRate,
+			cloudReliabilityWeight: candidate.cloudReliabilityWeight,
 			confidence: candidate.confidence,
 			blendedTtftMs: candidate.blendedTtftMs,
 			conservativeLatencyMs: candidate.conservativeLatencyMs,
@@ -218,9 +243,22 @@ export function evaluate(
 						);
 		const confidence =
 			upstreamTtftMs === undefined ? localConfidence : publicConfidence;
-		const errorRate = observation
+		const localErrorRate = observation
 			? Math.min(0.95, observation.errorRate * clamp01(outcomeConfidence))
 			: 0;
+		const cloudSuccessRate =
+			stat.cloudSuccessRate5m ?? stat.cloudSuccessRate6h;
+		// 云端窗口没有样本量,仅在本地结果不足时以最多 25% 权重补足冷启动盲区。
+		const cloudReliabilityWeight =
+			cloudSuccessRate === undefined
+				? 0
+				: 0.25 * (1 - clamp01(outcomeConfidence));
+		const errorRate = clamp01(
+			localErrorRate +
+				(cloudSuccessRate === undefined
+					? 0
+					: (1 - cloudSuccessRate) * cloudReliabilityWeight),
+		);
 		const conservativeLatencyMs =
 			(blendedTtftMs * (2 - confidence)) / Math.max(1 - errorRate, 0.2);
 
@@ -238,6 +276,9 @@ export function evaluate(
 			outcomeSampleCount,
 			successRate,
 			errorRate,
+			cloudCacheHitRate: stat.cloudCacheHitRate,
+			cloudSuccessRate,
+			cloudReliabilityWeight,
 			confidence,
 			blendedTtftMs,
 			conservativeLatencyMs,
@@ -317,6 +358,9 @@ export function evaluate(
 			outcomeSampleCount: candidate.outcomeSampleCount,
 			successRate: candidate.successRate,
 			errorRate: candidate.errorRate,
+			cloudCacheHitRate: candidate.cloudCacheHitRate,
+			cloudSuccessRate: candidate.cloudSuccessRate,
+			cloudReliabilityWeight: candidate.cloudReliabilityWeight,
 			confidence: candidate.confidence,
 			blendedTtftMs: candidate.blendedTtftMs,
 			conservativeLatencyMs: candidate.conservativeLatencyMs,

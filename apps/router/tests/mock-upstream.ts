@@ -110,6 +110,14 @@ export class MockAIHub {
 					user_avg_ttft_ms: stat.userAvgTtftMs ?? 0,
 					user_sample_count: stat.userSampleCount ?? 0,
 					user_has_data: stat.userAvgTtftMs !== undefined,
+					cache_hit_rate:
+						stat.cloudCacheHitRate === undefined
+							? undefined
+							: `${(stat.cloudCacheHitRate * 100).toFixed(2)}%`,
+					success_rates: {
+						"5m": stat.cloudSuccessRate5m,
+						"6h": stat.cloudSuccessRate6h,
+					},
 				})),
 			});
 		}

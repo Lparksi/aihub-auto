@@ -13,6 +13,7 @@ export {
 	recommendTopN,
 	sortCandidates,
 	allCandidates,
+	cacheUtilityBonus,
 } from "./scoring.ts";
 export {
 	decide,

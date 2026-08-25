@@ -37,6 +37,12 @@ export const DEFAULT_DECISION_POLICY: DecisionPolicy = {
 	minDwellMs: 90_000,
 };
 
+/**
+ * 缓存命中对请求效用的最大贡献(对数效用单位)。
+ * 命中率只作为冷启动偏好，已有会话仍由会话亲和保证，不会被重新排序迁移。
+ */
+export const DEFAULT_CACHE_UTILITY_MAX = 0.25;
+
 /** 本地观测 EWMA 系数 */
 export const LOCAL_EWMA_ALPHA = 0.3;
 /** 本地 TTFT 短窗口大小(P90/CV)。 */

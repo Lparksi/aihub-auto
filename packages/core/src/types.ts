@@ -18,6 +18,12 @@ export interface GroupStat {
 	userAvgTtftMs?: number;
 	/** 官网真实用户 TTFT 样本数;只用于解释,不因样本少排除。 */
 	userSampleCount?: number;
+	/** Provider 近期缓存命中率,0..1。 */
+	cloudCacheHitRate?: number;
+	/** Provider 近 5 分钟成功率,0..1。 */
+	cloudSuccessRate5m?: number;
+	/** Provider 近 6 小时成功率,0..1,用于 5 分钟窗口缺失时回退。 */
+	cloudSuccessRate6h?: number;
 	sampleCount: number;
 	/** ISO 8601 */
 	lastSampleAt: string;
@@ -42,6 +48,9 @@ export interface ProviderLatencyStat {
 	userSampleCount: number;
 	supportedModels?: string[];
 	modelAvailabilityKnown?: boolean;
+	cloudCacheHitRate?: number;
+	cloudSuccessRate5m?: number;
+	cloudSuccessRate6h?: number;
 }
 
 export interface GroupInfo {
@@ -178,8 +187,14 @@ export interface ScoredCandidate {
 	outcomeSampleCount: number;
 	/** 最近 3 小时本地最终结果窗口成功率。 */
 	successRate: number;
-	/** 本地近期失败率 */
+	/** 用本地观测与云端低置信度先验合成的失败率。 */
 	errorRate: number;
+	/** Provider 近期缓存命中率,0..1。 */
+	cloudCacheHitRate?: number;
+	/** 被用于冷启动可靠性先验的云端成功率(优先 5 分钟)。 */
+	cloudSuccessRate?: number;
+	/** 云端成功率先验实际权重;本地结果置信度提高后衰减至 0。 */
+	cloudReliabilityWeight: number;
 	/** 本地融合后的延迟(未保守修正) */
 	blendedTtftMs: number;
 	/** 综合不确定性、尾延迟与失败重试成本后的延迟 */
@@ -211,6 +226,9 @@ export interface ExcludedCandidate {
 		| "localSampleCount"
 		| "outcomeSampleCount"
 		| "successRate"
+		| "cloudCacheHitRate"
+		| "cloudSuccessRate"
+		| "cloudReliabilityWeight"
 		| "confidence"
 		| "blendedTtftMs"
 		| "conservativeLatencyMs"

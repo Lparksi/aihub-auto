@@ -103,6 +103,15 @@ function positive(v: unknown): number | undefined {
 	return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+function rate(v: unknown): number | undefined {
+	if (typeof v === "string") {
+		const percent = v.trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*%$/);
+		if (percent) return rate(Number(percent[1]) / 100);
+	}
+	const value = num(v);
+	return Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
+}
+
 export function parseProviderLatencyStat(
 	raw: unknown,
 ): ProviderLatencyStat | undefined {
@@ -130,6 +139,16 @@ export function parseProviderLatencyStat(
 			? undefined
 			: positive(r["user_avg_ttft_ms"] ?? r["userAvgTtftMs"]);
 	const capability = supportedModelsFrom(r);
+	const userSampleCount =
+		userAvgTtftMs === undefined
+			? 0
+			: Math.max(
+					0,
+					Math.floor(
+						num(r["user_sample_count"] ?? r["userSampleCount"]) || 0,
+					),
+				);
+	const successRates = asRecord(r["success_rates"] ?? r["successRates"]);
 	return {
 		groupId,
 		platform,
@@ -148,6 +167,9 @@ export function parseProviderLatencyStat(
 		...(capability.known
 			? { supportedModels: capability.models, modelAvailabilityKnown: true }
 			: {}),
+		cloudCacheHitRate: rate(r["cache_hit_rate"] ?? r["cacheHitRate"]),
+		cloudSuccessRate5m: rate(successRates["5m"]),
+		cloudSuccessRate6h: rate(successRates["6h"]),
 	};
 }
 
@@ -167,6 +189,9 @@ export function mergeProviderLatencies(
 					...(provider.modelAvailabilityKnown
 						? { supportedModels: provider.supportedModels, modelAvailabilityKnown: true }
 						: {}),
+					cloudCacheHitRate: provider.cloudCacheHitRate,
+					cloudSuccessRate5m: provider.cloudSuccessRate5m,
+					cloudSuccessRate6h: provider.cloudSuccessRate6h,
 				}
 			: stat;
 	});
