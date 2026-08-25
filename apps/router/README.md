@@ -40,6 +40,7 @@ export OPENAI_API_KEY="anything"          # 本地代理自动注入真实 Key,�
 ## Key 模式
 
 - **pool(默认)**:按需为每个使用中的组创建 `aihub-auto-g{组id}` Key。新会话用 P2C + Peak EWMA 在当前价格层内分配,已有会话保持组亲和;一个组可同时承载多个请求,同组并发创建 Key 只发一次管理请求。会话映射保留 24 小时,但 Key 只在最近缓存窗口(默认 5 分钟)受亲和保护;之后可由普通 LRU 回收,续接时按原组重建。多个实例共享账号时不会互删未知自动 Key;上游 401 会使失效的 managed Key 原子作废、同组重建并重试。超倍率、用户黑名单、账号不可用、延迟无效、近 3 小时稳定率过低或已不在最新统计中的闲置组可强制回收。当前组、创建中、预留中、在飞组始终受保护。**绝不触碰手动创建的 Key**
+- **Luna 独立池**:请求模型名包含 `luna` 时，自动使用名称为 `aihub-auto-luna-g{组id}` 的独立 Key 池、独立 LRU 上限和单独候选池。只要 AIHub 返回任一明确支持 Luna 的渠道，未知或明确不支持 Luna 的渠道都不会进入该模型的候选；若上游完全不提供模型能力数据，才回退到原有的请求失败学习机制。该隔离仅在 `pool` 模式可用。
 - **single(兼容)**:使用现有的一把 Key,切组 = `PUT /api/v1/keys/{id}`。代理流与控制面切组共享 FIFO 租约,长流结束前不会中途改 Key 分组;上游单 Key 的全局语义仍无法像 pool 一样并行使用不同组,仅供账号不能自动创建 Key 时使用。
 
 ## 为什么比 AIHubRouter 好
@@ -82,6 +83,7 @@ AIHUB_AUTO_PORT=9000 ./aihub-auto
 | `economyPolicy.maxConservativeLatencyMs` | 20000 | 省钱模式最大保守 TTFT |
 | `keyMode` | `pool` | pool / single;启动级配置,修改后需重启 |
 | `poolMaxGroups` | 4 | 新会话参与均衡的候选/池目标数;安全条件不满足时允许软超限;修改后需重启 |
+| `lunaPoolMaxGroups` | 4 | Luna 独立候选/Key 池的容量上限;仅 `pool` 模式有效,修改后需重启 |
 | `sessionTtlMs` | 86400000 | 会话与模型能力记录保留时间 |
 | `sessionMaxEntries` | 10000 | 会话记录上限 |
 | `pollIntervalMs` | 60000 | 路由轮询间隔 |

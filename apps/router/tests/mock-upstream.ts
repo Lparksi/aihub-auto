@@ -94,6 +94,9 @@ export class MockAIHub {
 					sample_count: s.sampleCount,
 					last_sample_at: s.lastSampleAt,
 					group_id: s.groupId,
+					...(s.modelAvailabilityKnown
+						? { models: s.supportedModels ?? [] }
+						: {}),
 				}));
 			return this.envelope({ items, total: items.length, sample_limit: 100 });
 		}
@@ -110,6 +113,9 @@ export class MockAIHub {
 					user_avg_ttft_ms: stat.userAvgTtftMs ?? 0,
 					user_sample_count: stat.userSampleCount ?? 0,
 					user_has_data: stat.userAvgTtftMs !== undefined,
+					...(stat.modelAvailabilityKnown
+						? { models: stat.supportedModels ?? [] }
+						: {}),
 					cache_hit_rate:
 						stat.cloudCacheHitRate === undefined
 							? undefined

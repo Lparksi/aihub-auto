@@ -18,7 +18,7 @@ import {
 } from "@aihub-auto/core";
 import { randomUUID } from "node:crypto";
 import type { AppConfig, AppState, Credentials } from "./config.ts";
-import type { ActiveKey, RouteExecutor } from "./executor.ts";
+import type { ActiveKey, ManagedPool, RouteExecutor } from "./executor.ts";
 import type { AuditLog, Logger } from "./logger.ts";
 import {
 	hashIdentity,
@@ -77,6 +77,11 @@ export function matchesAccountPool(
 	if (!plans.length) return true;
 	const value = name.trim().toLowerCase();
 	return plans.some((plan) => new RegExp(`\\b${plan}\\b`, "i").test(value));
+}
+
+/** Luna 模型使用独立托管 Key 池，模型别名同样适用。 */
+export function isLunaModel(model: string | undefined): boolean {
+	return typeof model === "string" && model.trim().toLowerCase().includes("luna");
 }
 
 /** 公开统计控制面 + 请求本地 P2C/Peak-EWMA 路由面。 */
@@ -224,7 +229,10 @@ export class RouteDaemon {
 		// 拉取成功的最新统计中已不存在的历史组没有复用价值;拉取失败时不猜测。
 		if (!statsStale) {
 			const latestGroupIds = new Set(items.map((item) => item.groupId));
-			for (const groupId of Object.keys(this.deps.state.pool).map(Number)) {
+			for (const groupId of [
+				...Object.keys(this.deps.state.pool),
+				...Object.keys(this.deps.state.lunaPool),
+			].map(Number)) {
 				if (!latestGroupIds.has(groupId)) groupIds.add(groupId);
 			}
 		}
@@ -551,6 +559,7 @@ export class RouteDaemon {
 		request: RouteRequest,
 	): Promise<ActiveKey | undefined> {
 		const now = Date.now();
+		const pool = this.requestPool(request);
 		const items = this.applyMaxRate(await this.routingItems(request.model), request.maxRate);
 		const failed = new Set(request.failedGroupIds ?? []);
 		for (const groupId of this.modelBlockedGroupIds(request.model, now)) {
@@ -626,6 +635,7 @@ export class RouteDaemon {
 				evaluation,
 				request.sessionKey ?? randomUUID(),
 				preferCloudCache,
+				this.poolMaxGroups(pool),
 			);
 			if (!target) break;
 			if (this.deps.breaker.allowRequest(target.stat.groupId, now)) break;
@@ -666,14 +676,31 @@ export class RouteDaemon {
 		const items = cached?.length ? cached : (await this.fetchStats("openai")).items;
 		if (!model) return items;
 		const requested = model.trim().toLowerCase();
-		return items.filter((item) =>
-			item.modelAvailabilityKnown !== true ||
+		const supportsRequested = (item: GroupStat): boolean =>
 			(item.supportedModels ?? []).some((candidate) => {
 				const normalized = candidate.toLowerCase();
 				return normalized === requested ||
 					(normalized.endsWith("*") && requested.startsWith(normalized.slice(0, -1)));
-			}),
+			});
+		const knownMatches = items.filter(
+			(item) => item.modelAvailabilityKnown === true && supportsRequested(item),
 		);
+		// Luna 有明确能力数据时绝不探测未知渠道，避免不支持它的渠道
+		// 反复进入故障转移；旧版 API 未提供任何模型数据时保留兼容回退。
+		if (isLunaModel(model) && knownMatches.length > 0) return knownMatches;
+		return items.filter(
+			(item) => item.modelAvailabilityKnown !== true || supportsRequested(item),
+		);
+	}
+
+	private requestPool(request: RouteRequest): ManagedPool {
+		return isLunaModel(request.model) ? "luna" : "default";
+	}
+
+	private poolMaxGroups(pool: ManagedPool): number {
+		return pool === "luna"
+			? this.deps.config.lunaPoolMaxGroups
+			: this.deps.config.poolMaxGroups;
 	}
 
 	private matchesAccountPool(name: string): boolean {
@@ -740,10 +767,11 @@ export class RouteDaemon {
 		now: number,
 		effectiveRate?: number,
 	): Promise<ActiveKey> {
+		const pool = this.requestPool(request);
 		const releasePending = this.deps.traffic.reserve(groupId);
 		let key: ActiveKey;
 		try {
-			key = await this.deps.executor.acquireKey(groupId);
+			key = await this.deps.executor.acquireKey(groupId, pool);
 		} catch (err) {
 			releasePending();
 			this.deps.breaker.releaseRequest(groupId, now);
@@ -780,12 +808,13 @@ export class RouteDaemon {
 		evaluation: Evaluation,
 		seed: string,
 		preferCloudCache = false,
+		poolMaxGroups = this.deps.config.poolMaxGroups,
 	): ScoredCandidate | undefined {
 		// 请求调度使用显式池上限,不复用 Koishi 展示用的 scoreWindow。
 		// 否则健康容量会在负载计算前被永久排除。
 		const candidates = evaluation.eligible
 			.filter((candidate) => Number.isFinite(candidate.score))
-			.slice(0, this.deps.config.poolMaxGroups);
+			.slice(0, poolMaxGroups);
 		if (candidates.length <= 1) return candidates[0];
 
 		// 小池场景始终让静态最优组参加比较,再按会话稳定抽一个挑战者。

@@ -91,6 +91,7 @@ export function createHarness(opts?: {
 		keyMode: config.keyMode,
 		singleKeyId: config.singleKeyId,
 		poolMaxGroups: config.poolMaxGroups,
+		lunaPoolMaxGroups: config.lunaPoolMaxGroups,
 		evictionGraceMs: config.decision.cacheIdleMs,
 		hardProtectedGroupIds: () => traffic.activeGroupIds(),
 		softProtectedGroupIds: () => {
@@ -100,8 +101,8 @@ export function createHarness(opts?: {
 			}
 			return groups;
 		},
-		onPoolKeyRemoved: (groupId, forced) => {
-			if (forced) affinity.forgetGroup(groupId);
+		onPoolKeyRemoved: (groupId, forced, pool) => {
+			if (forced && pool === "default") affinity.forgetGroup(groupId);
 		},
 		persistState,
 		persistCredentials,

@@ -155,6 +155,8 @@ export const ConfigSchema = z
 	/** 兼容模式:指定要被全局切组的 keyId;缺省自动选第一个 */
 	singleKeyId: z.number().int().optional(),
 	poolMaxGroups: z.number().int().min(1).max(20).default(4),
+	/** Luna 模型使用独立的托管 Key 池和容量上限。 */
+	lunaPoolMaxGroups: z.number().int().min(1).max(20).default(4),
 	/** 会话映射保留 24h;池 Key 仅按 cacheIdleMs 短期保护。 */
 	sessionTtlMs: z
 		.number()
@@ -234,8 +236,19 @@ export const StateSchema = z.object({
 	pendingSwitch: z
 		.object({ groupId: z.number().int(), since: z.number() })
 		.optional(),
-	/** pool Key:groupId -> {keyId, sk, lastUsedAt} */
+	/** 通用模型的 pool Key:groupId -> {keyId, sk, lastUsedAt} */
 	pool: z
+		.record(
+			z.string(),
+			z.object({
+				keyId: z.number().int(),
+				sk: z.string(),
+				lastUsedAt: z.number(),
+			}),
+		)
+		.default({}),
+	/** Luna 模型的独立 pool Key:groupId -> {keyId, sk, lastUsedAt} */
+	lunaPool: z
 		.record(
 			z.string(),
 			z.object({

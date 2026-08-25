@@ -356,6 +356,7 @@ export async function handleControl(
 				? []
 				: [deps.state.manualLock.groupId]),
 			...Object.keys(deps.state.pool).map(Number),
+			...Object.keys(deps.state.lunaPool).map(Number),
 			...Object.keys(affinity.byGroup).map(Number),
 			...Object.keys(affinity.aliasesByGroup).map(Number),
 			...Object.keys(traffic.activeByGroup ?? {}).map(Number),
@@ -442,6 +443,7 @@ export async function handleControl(
 				accountPoolPlans: deps.config.accountPoolPlans,
 				keyMode: deps.config.keyMode,
 				poolMaxGroups: deps.config.poolMaxGroups,
+				lunaPoolMaxGroups: deps.config.lunaPoolMaxGroups,
 				priceBand: deps.config.priceBand,
 				economyPolicy: deps.config.economyPolicy,
 				upstreamUserAgent: deps.config.upstreamUserAgent,
@@ -453,6 +455,12 @@ export async function handleControl(
 			},
 			pool: Object.fromEntries(
 				Object.entries(deps.state.pool).map(([groupId, entry]) => [
+					groupId,
+					{ keyId: entry.keyId, lastUsedAt: entry.lastUsedAt },
+				]),
+			),
+			lunaPool: Object.fromEntries(
+				Object.entries(deps.state.lunaPool).map(([groupId, entry]) => [
 					groupId,
 					{ keyId: entry.keyId, lastUsedAt: entry.lastUsedAt },
 				]),
@@ -555,7 +563,7 @@ export async function handleControl(
 		} catch {
 			return json({ error: "非法 JSON" }, 400);
 		}
-		const restartRequired = ["keyMode", "poolMaxGroups"].filter(
+		const restartRequired = ["keyMode", "poolMaxGroups", "lunaPoolMaxGroups"].filter(
 			(key) => key in patch,
 		);
 		if (restartRequired.length > 0) {

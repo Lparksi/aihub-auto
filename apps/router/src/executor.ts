@@ -4,6 +4,9 @@ import type { AppState, Credentials } from "./config.ts";
 import type { Logger } from "./logger.ts";
 
 export const POOL_KEY_PREFIX = "aihub-auto-g";
+export const LUNA_POOL_KEY_PREFIX = "aihub-auto-luna-g";
+
+export type ManagedPool = "default" | "luna";
 
 export interface ActiveKey {
 	sk: string;
@@ -30,13 +33,14 @@ export interface ExecutorDeps {
 	keyMode: "single" | "pool";
 	singleKeyId?: number;
 	poolMaxGroups: number;
+	lunaPoolMaxGroups: number;
 	evictionGraceMs?: number;
 	/** 当前请求、预留与正在创建之外的硬保护组。 */
 	hardProtectedGroupIds?: () => ReadonlySet<number>;
 	/** 会话/Responses 亲和软保护;硬无效组可越过它回收。 */
 	softProtectedGroupIds?: () => ReadonlySet<number>;
-	/** 远端托管 Key 删除成功后的通知;仅强制回收需要清掉亲和。 */
-	onPoolKeyRemoved?: (groupId: number, forced: boolean) => void;
+	/** 远端托管 Key 删除成功后的通知;仅通用池强制回收需要清掉亲和。 */
+	onPoolKeyRemoved?: (groupId: number, forced: boolean, pool: ManagedPool) => void;
 	persistState: () => Promise<void>;
 	persistCredentials: () => Promise<void>;
 	/** 401 时由 daemon 注入的续期回调;成功返回 true */
@@ -45,11 +49,29 @@ export interface ExecutorDeps {
 
 /** AIHub 账号上的 Key 执行层。pool 请求只确保目标组 Key,不改变全局路由。 */
 export class RouteExecutor {
-	private readonly creating = new Map<number, Promise<ActiveKey>>();
-	private readonly reservations = new Map<number, number>();
+	private readonly creating = new Map<string, Promise<ActiveKey>>();
+	private readonly reservations = new Map<string, number>();
 	private poolMutation: Promise<unknown> = Promise.resolve();
 
 	constructor(private readonly deps: ExecutorDeps) {}
+
+	private poolEntries(pool: ManagedPool): AppState["pool"] {
+		return pool === "luna" ? this.deps.state.lunaPool : this.deps.state.pool;
+	}
+
+	private poolLimit(pool: ManagedPool): number {
+		return pool === "luna"
+			? this.deps.lunaPoolMaxGroups
+			: this.deps.poolMaxGroups;
+	}
+
+	private scopedGroupId(pool: ManagedPool, groupId: number): string {
+		return `${pool}:${groupId}`;
+	}
+
+	private keyName(pool: ManagedPool, groupId: number): string {
+		return `${pool === "luna" ? LUNA_POOL_KEY_PREFIX : POOL_KEY_PREFIX}${groupId}`;
+	}
 
 	/** 控制面当前默认组对应的 Key。请求面应使用 ensureKey(groupId)。 */
 	currentKey(): ActiveKey | undefined {
@@ -87,7 +109,10 @@ export class RouteExecutor {
 	}
 
 	/** 请求面取得指定组 Key。single 模式因上游限制仍会全局切组。 */
-	async ensureKey(groupId: number): Promise<ActiveKey> {
+	async ensureKey(
+		groupId: number,
+		pool: ManagedPool = "default",
+	): Promise<ActiveKey> {
 		if (this.deps.keyMode === "single") {
 			const current = this.currentKey();
 			return current?.groupId === groupId
@@ -95,22 +120,24 @@ export class RouteExecutor {
 				: this.switchSingle(groupId);
 		}
 
-		const existing = this.creating.get(groupId);
+		const scopedGroupId = this.scopedGroupId(pool, groupId);
+		const entries = this.poolEntries(pool);
+		const existing = this.creating.get(scopedGroupId);
 		if (existing) return existing;
 
 		// 逐出期间不得读取即将删除的缓存 Key;acquireKey 的 reservation 已经
 		// 先可见,逐出会在远端删除前重新检查它。
 		await this.poolMutation.catch(() => undefined);
-		const cached = this.deps.state.pool[String(groupId)];
+		const cached = entries[String(groupId)];
 		if (cached) {
 			cached.lastUsedAt = Date.now();
 			return { sk: cached.sk, groupId };
 		}
-		const afterWaitCreating = this.creating.get(groupId);
+		const afterWaitCreating = this.creating.get(scopedGroupId);
 		if (afterWaitCreating) return afterWaitCreating;
 
 		const pending = this.serializePool(async () => {
-			const afterWait = this.deps.state.pool[String(groupId)];
+			const afterWait = entries[String(groupId)];
 			if (afterWait) {
 				afterWait.lastUsedAt = Date.now();
 				return { sk: afterWait.sk, groupId };
@@ -118,50 +145,60 @@ export class RouteExecutor {
 
 			const created = await this.withAuth(() =>
 				this.deps.client.createKey({
-					name: `${POOL_KEY_PREFIX}${groupId}`,
+					name: this.keyName(pool, groupId),
 					groupId,
 				}),
 			);
 			if (!created.key)
 				throw new Error("创建 Key 未返回 sk 明文,无法用于池模式");
 
-			this.deps.state.pool[String(groupId)] = {
+			entries[String(groupId)] = {
 				keyId: created.id,
 				sk: created.key,
 				lastUsedAt: Date.now(),
 			};
-			this.deps.logger.info(`池新建 Key:group=${groupId} keyId=${created.id}`);
-			await this.evictLru(groupId);
+			this.deps.logger.info(
+				`${pool === "luna" ? "Luna 池" : "池"}新建 Key:group=${groupId} keyId=${created.id}`,
+			);
+			await this.evictLru(pool, groupId);
 			await this.deps.persistState();
 			return { sk: created.key, groupId };
 		});
-		this.creating.set(groupId, pending);
+		this.creating.set(scopedGroupId, pending);
 		const clear = () => {
-			if (this.creating.get(groupId) === pending) this.creating.delete(groupId);
+			if (this.creating.get(scopedGroupId) === pending)
+				this.creating.delete(scopedGroupId);
 		};
 		void pending.then(clear, clear);
 		return pending;
 	}
 
 	/** 请求面租约:TrafficTracker 接管保护前,Lru 不得删除这把 Key。 */
-	async acquireKey(groupId: number): Promise<ActiveKey> {
-		this.reservations.set(groupId, (this.reservations.get(groupId) ?? 0) + 1);
+	async acquireKey(
+		groupId: number,
+		pool: ManagedPool = "default",
+	): Promise<ActiveKey> {
+		const scopedGroupId = this.scopedGroupId(pool, groupId);
+		this.reservations.set(
+			scopedGroupId,
+			(this.reservations.get(scopedGroupId) ?? 0) + 1,
+		);
 		let released = false;
 		const release = () => {
 			if (released) return;
 			released = true;
-			const next = (this.reservations.get(groupId) ?? 1) - 1;
-			if (next > 0) this.reservations.set(groupId, next);
-			else this.reservations.delete(groupId);
+			const next = (this.reservations.get(scopedGroupId) ?? 1) - 1;
+			if (next > 0) this.reservations.set(scopedGroupId, next);
+			else this.reservations.delete(scopedGroupId);
 		};
 		try {
-			const key = await this.ensureKey(groupId);
+			const key = await this.ensureKey(groupId, pool);
 			return {
 				...key,
 				release,
 				invalidateCredential:
 					this.deps.keyMode === "pool"
-						? () => this.invalidatePoolKey(groupId, key.sk)
+						? () => this.invalidatePoolKey(groupId, key.sk, pool)
 						: undefined,
 			};
 		} catch (err) {
@@ -177,14 +214,16 @@ export class RouteExecutor {
 	async invalidatePoolKey(
 		groupId: number,
 		expectedSk: string,
+		pool: ManagedPool = "default",
 	): Promise<boolean> {
 		if (this.deps.keyMode !== "pool") return false;
 		return this.serializePool(async () => {
-			const entry = this.deps.state.pool[String(groupId)];
+			const entries = this.poolEntries(pool);
+			const entry = entries[String(groupId)];
 			if (!entry || entry.sk !== expectedSk) return false;
-			delete this.deps.state.pool[String(groupId)];
+			delete entries[String(groupId)];
 			this.deps.logger.warn(
-				`池 Key 被上游拒绝,本地作废并重建:group=${groupId} keyId=${entry.keyId}`,
+				`${pool === "luna" ? "Luna 池" : "池"} Key 被上游拒绝,本地作废并重建:group=${groupId} keyId=${entry.keyId}`,
 			);
 			await this.deps.persistState();
 			return true;
@@ -245,7 +284,9 @@ export class RouteExecutor {
 	): Promise<number> {
 		if (this.deps.keyMode !== "pool") return 0;
 		return this.serializePool(async () => {
-			const removed = await this.evictLru(undefined, forceReclaimGroupIds);
+			const removed =
+				(await this.evictLru("default", undefined, forceReclaimGroupIds)) +
+				(await this.evictLru("luna", undefined, forceReclaimGroupIds));
 			if (removed > 0) await this.deps.persistState();
 			return removed;
 		});
@@ -253,24 +294,25 @@ export class RouteExecutor {
 
 	/** 超容量立即按 LRU 收缩无保护 Key;强无效组过宽限期后可越过软保护。 */
 	private async evictLru(
+		pool: ManagedPool,
 		protectGroupId?: number,
 		forceReclaimGroupIds: ReadonlySet<number> = new Set(),
 	): Promise<number> {
 		const { state, logger } = this.deps;
+		const entries = this.poolEntries(pool);
 		const isHardProtected = (groupId: number): boolean =>
 			(protectGroupId !== undefined && groupId === protectGroupId) ||
-			groupId === state.currentGroupId ||
-			this.creating.has(groupId) ||
-			this.reservations.has(groupId) ||
+			(pool === "default" && groupId === state.currentGroupId) ||
+			this.creating.has(this.scopedGroupId(pool, groupId)) ||
+			this.reservations.has(this.scopedGroupId(pool, groupId)) ||
 			(this.deps.hardProtectedGroupIds?.().has(groupId) ?? false);
 		const isSoftProtected = (groupId: number): boolean =>
 			this.deps.softProtectedGroupIds?.().has(groupId) ?? false;
 		const grace = this.deps.evictionGraceMs ?? 0;
 		const now = Date.now();
 		let removed = 0;
-		const overCapacity =
-			Object.keys(state.pool).length > this.deps.poolMaxGroups;
-		const victims = Object.entries(state.pool)
+		const overCapacity = Object.keys(entries).length > this.poolLimit(pool);
+		const victims = Object.entries(entries)
 			.filter(([groupId, entry]) => {
 				const id = Number(groupId);
 				const forced = forceReclaimGroupIds.has(id);
@@ -286,17 +328,17 @@ export class RouteExecutor {
 			const [groupId, entry] = victims.shift()!;
 			const id = Number(groupId);
 			const forced = forceReclaimGroupIds.has(id);
-			if (!forced && Object.keys(state.pool).length <= this.deps.poolMaxGroups)
+			if (!forced && Object.keys(entries).length <= this.poolLimit(pool))
 				break;
 			// 快照之后可能出现创建/预留/在飞请求;删除前必须重新确认。
 			if (isHardProtected(id) || (!forced && isSoftProtected(id))) continue;
 			try {
 				await this.withAuth(() => this.deps.client.deleteKey(entry.keyId));
-				delete state.pool[groupId];
-				this.deps.onPoolKeyRemoved?.(id, forced);
+				delete entries[groupId];
+				this.deps.onPoolKeyRemoved?.(id, forced, pool);
 				removed++;
 				logger.info(
-					`${forced ? "池强制回收" : "池 LRU 删除"}:group=${groupId} keyId=${entry.keyId}`,
+					`${pool === "luna" ? "Luna 池" : "池"}${forced ? "强制回收" : " LRU 删除"}:group=${groupId} keyId=${entry.keyId}`,
 				);
 			} catch (err) {
 				logger.warn(
@@ -315,17 +357,23 @@ export class RouteExecutor {
 	async reconcile(): Promise<void> {
 		if (this.deps.keyMode !== "pool") return;
 		await this.serializePool(async () => {
-			const { state, logger } = this.deps;
+			const { logger } = this.deps;
 			const keys = await this.withAuth(() => this.deps.client.listAllKeys());
 			const remoteIds = new Set(keys.map((key) => key.id));
 
-			for (const [groupId, entry] of Object.entries(state.pool)) {
-				if (!remoteIds.has(entry.keyId)) {
-					delete state.pool[groupId];
-					logger.warn(`池记录失效(远端已删):group=${groupId}`);
+			for (const pool of ["default", "luna"] as const) {
+				const entries = this.poolEntries(pool);
+				for (const [groupId, entry] of Object.entries(entries)) {
+					if (!remoteIds.has(entry.keyId)) {
+						delete entries[groupId];
+						logger.warn(
+							`${pool === "luna" ? "Luna 池" : "池"}记录失效(远端已删):group=${groupId}`,
+						);
+					}
 				}
 			}
-			await this.evictLru();
+			await this.evictLru("default");
+			await this.evictLru("luna");
 			await this.deps.persistState();
 		});
 	}
@@ -333,15 +381,18 @@ export class RouteExecutor {
 	/** 退出清理(可选):删除全部自建 Key。 */
 	async cleanup(): Promise<void> {
 		await this.serializePool(async () => {
-			const { state, logger } = this.deps;
-			for (const [groupId, entry] of Object.entries(state.pool)) {
-				try {
-					await this.withAuth(() => this.deps.client.deleteKey(entry.keyId));
-					delete state.pool[groupId];
-				} catch (err) {
-					logger.warn(
-						`退出清理失败:keyId=${entry.keyId} ${err instanceof Error ? err.message : ""}`,
-					);
+			const { logger } = this.deps;
+			for (const pool of ["default", "luna"] as const) {
+				const entries = this.poolEntries(pool);
+				for (const [groupId, entry] of Object.entries(entries)) {
+					try {
+						await this.withAuth(() => this.deps.client.deleteKey(entry.keyId));
+						delete entries[groupId];
+					} catch (err) {
+						logger.warn(
+							`退出清理失败:keyId=${entry.keyId} ${err instanceof Error ? err.message : ""}`,
+						);
+					}
 				}
 			}
 			await this.deps.persistState();

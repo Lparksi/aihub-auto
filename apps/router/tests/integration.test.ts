@@ -33,6 +33,43 @@ describe("守护循环", () => {
 		expect(res.status).toBe(200);
 	});
 
+	test("Luna 在独立池中只选择明确支持它的渠道", async () => {
+		h = createHarness({
+			configPatch: { keyMode: "pool", poolMaxGroups: 1, lunaPoolMaxGroups: 1 },
+		});
+		h.mock.stats = [
+			makeStat({
+				groupId: 1,
+				rateMultiplier: 0.02,
+				avgTtftMs: 900,
+				supportedModels: ["gpt-5.6-sol"],
+				modelAvailabilityKnown: true,
+			}),
+			makeStat({
+				groupId: 2,
+				rateMultiplier: 0.03,
+				avgTtftMs: 1500,
+				supportedModels: ["gpt-5.6-luna"],
+				modelAvailabilityKnown: true,
+			}),
+			makeStat({ groupId: 3, rateMultiplier: 0.01, avgTtftMs: 100 }),
+		];
+		await h.daemon.runOnce();
+
+		const luna = await h.daemon.route({
+			sessionKey: "luna-session",
+			model: "gpt-5.6-luna",
+		});
+		try {
+			expect(luna?.groupId).toBe(2);
+			expect(h.state.pool["2"]).toBeUndefined();
+			expect(h.state.lunaPool["2"]?.keyId).toBeDefined();
+			expect([...h.mock.keys.values()].some((key) => key.name === "aihub-auto-luna-g2")).toBe(true);
+		} finally {
+			luna?.release?.();
+		}
+	});
+
 	test("provider 不可用时排除仍有 usage 样本的分组", async () => {
 		h = createHarness({ configPatch: { keyMode: "pool" } });
 		h.mock.stats = [

@@ -225,6 +225,20 @@ describe("executor 模式 pool", () => {
 		expect(h.state.pool["1"]?.sk).toBe(fresh.sk);
 	});
 
+	test("Luna Key 使用独立命名空间和状态池", async () => {
+		h = poolHarness();
+		const normal = await h.executor.ensureKey(1);
+		const luna = await h.executor.ensureKey(1, "luna");
+
+		expect(normal.sk).not.toBe(luna.sk);
+		expect(h.state.pool["1"]?.sk).toBe(normal.sk);
+		expect(h.state.lunaPool["1"]?.sk).toBe(luna.sk);
+		expect([...h.mock.keys.values()].map((key) => key.name).sort()).toEqual([
+			"aihub-auto-g1",
+			"aihub-auto-luna-g1",
+		]);
+	});
+
 	test("cleanup 删除全部自建 Key", async () => {
 		h = poolHarness();
 		await h.executor.switchTo(1);

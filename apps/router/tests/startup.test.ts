@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyManagedSecretOverrides, ConfigSchema } from "../src/config.ts";
+import { applyManagedSecretOverrides, ConfigSchema, StateSchema } from "../src/config.ts";
 import { matchesAccountPool } from "../src/daemon.ts";
 import {
 	applyStartupOptions,
@@ -60,6 +60,15 @@ describe("startup options", () => {
 		expect(matchesAccountPool("A003-Pro", [], "mixed")).toBe(true);
 		expect(matchesAccountPool("A008-BugTeam", [], "mixed")).toBe(false);
 		expect(ConfigSchema.parse({ accountPoolPlans: ["team", "plus"] }).accountPoolPlans).toEqual(["team", "plus"]);
+	});
+
+	test("旧状态自动补齐独立 Luna 池配置", () => {
+		expect(ConfigSchema.parse({}).lunaPoolMaxGroups).toBe(4);
+		expect(
+			StateSchema.parse({
+				pool: { "1": { keyId: 1, sk: "sk-old", lastUsedAt: 1 } },
+			}).lunaPool,
+		).toEqual({});
 	});
 
 	test("managed secrets override persisted router secrets", () => {
