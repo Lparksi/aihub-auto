@@ -802,6 +802,14 @@ export class RouteDaemon {
 		return stableUnitInterval(`${seed}:p2c:tie`) < 0.5 ? first : second;
 	}
 
+	isHalfOpenProbeEligible(stat: GroupStat, now = Date.now()): boolean {
+		const breaker = this.deps.breaker
+			.snapshot(now)
+			.find((entry) => entry.groupId === stat.groupId);
+		return breaker?.state === "half-open" &&
+			this.hardEligible(stat.groupId, [stat], new Set(), now, true);
+	}
+
 	private halfOpenProbe(
 		items: readonly GroupStat[],
 		blocked: ReadonlySet<number>,

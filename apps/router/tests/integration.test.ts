@@ -95,6 +95,45 @@ describe("守护循环", () => {
 		expect(h.config.blacklist).toEqual([]);
 	});
 
+	test("熔断冷却后状态接口重新公布半开探测候选", async () => {
+		h = createHarness({
+			withServer: true,
+			configPatch: { keyMode: "pool" },
+		});
+		h.mock.stats = [makeStat({ groupId: 1, rateMultiplier: 0.08 })];
+		const failureAt = Date.now() - 31_000;
+		for (let i = 0; i < 3; i++) h.breaker.recordFailure(1, failureAt);
+
+		const round = await h.daemon.runOnce();
+		expect(
+			round.evaluation.excluded.find(
+				(candidate) => candidate.stat.groupId === 1,
+			)?.excludeReason,
+		).toBe("circuit_open");
+
+		const status = (await fetch(`${h.serverUrl}/ctl/status`).then((response) =>
+			response.json(),
+		)) as {
+			candidates: Array<{
+				groupId: number;
+				rate: number;
+				excluded: boolean;
+				standby?: boolean;
+			}>;
+		};
+		expect(status.candidates.find((candidate) => candidate.groupId === 1)).toMatchObject({
+			rate: 0.08,
+			excluded: false,
+			standby: true,
+		});
+
+		const probe = await handleProxy(proxyReq(), h.proxyDeps);
+		expect(probe.status).toBe(200);
+		expect(
+			h.breaker.snapshot().find((entry) => entry.groupId === 1)?.state,
+		).toBe("closed");
+	});
+
 	test("超出价格区间的闲置池组会在守护轮回收并清理亲和", async () => {
 		h = createHarness({
 			configPatch: {

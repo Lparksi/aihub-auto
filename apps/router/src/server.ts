@@ -282,6 +282,9 @@ export async function handleControl(
 				});
 			}
 			for (const e of round.evaluation.excluded) {
+				const halfOpenProbeEligible =
+					e.excludeReason === "circuit_open" &&
+					deps.daemon.isHalfOpenProbeEligible(e.stat, now);
 				candidates.push({
 					groupId: e.stat.groupId,
 					code: e.stat.code,
@@ -315,9 +318,11 @@ export async function handleControl(
 						? Number(e.evidence.successRate.toFixed(3))
 						: undefined,
 					outcomeSamples: e.evidence?.outcomeSampleCount,
-					excluded: true,
-					excludeReason: e.excludeReason,
-					forceable: MANUAL_LOCK_OVERRIDE_REASONS.has(e.excludeReason),
+					standby: halfOpenProbeEligible || undefined,
+					excluded: !halfOpenProbeEligible,
+					excludeReason: halfOpenProbeEligible ? undefined : e.excludeReason,
+					forceable:
+						halfOpenProbeEligible || MANUAL_LOCK_OVERRIDE_REASONS.has(e.excludeReason),
 				});
 			}
 		}
