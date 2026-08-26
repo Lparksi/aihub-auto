@@ -1,0 +1,134 @@
+name: CPA plugin
+
+on:
+  push:
+    paths:
+      - "cpa-plugin/**"
+      - ".github/workflows/cpa-plugin.yml"
+  pull_request:
+    paths:
+      - "cpa-plugin/**"
+      - ".github/workflows/cpa-plugin.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-vet:
+    name: Test and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: main
+          path: .cpa-main
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .cpa-main/go.mod
+          cache: true
+          cache-dependency-path: |
+            cpa-plugin/go.sum
+            .cpa-main/go.sum
+      - name: Download CPA modules
+        working-directory: .cpa-main
+        run: go mod download
+      - name: Point the plugin at checked-out CPA main
+        working-directory: cpa-plugin
+        run: go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7="${GITHUB_WORKSPACE}/.cpa-main"
+      - name: Download Go modules
+        working-directory: cpa-plugin
+        run: go mod download
+      - name: Run plugin tests
+        working-directory: cpa-plugin
+        run: go test ./...
+      - name: Vet plugin
+        working-directory: cpa-plugin
+        run: go vet ./...
+
+  compatibility:
+    name: Current CPA main loader compatibility
+    needs: test-and-vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: main
+          path: .cpa-main
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .cpa-main/go.mod
+          cache: true
+          cache-dependency-path: |
+            cpa-plugin/go.sum
+            .cpa-main/go.sum
+      - name: Download CPA modules
+        working-directory: .cpa-main
+        run: go mod download
+      - name: Point the plugin at checked-out CPA main
+        working-directory: cpa-plugin
+        run: go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7="${GITHUB_WORKSPACE}/.cpa-main"
+      - name: Download Go modules
+        working-directory: cpa-plugin
+        run: go mod download
+      - name: Run real dynamic loader fixture
+        working-directory: cpa-plugin
+        run: go test -tags=cpa_dynamic_loader ./integration
+
+  build-native:
+    name: Build ${{ matrix.platform }} native artifact
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-latest
+            target: build-darwin
+          - platform: linux
+            runner: ubuntu-latest
+            target: build-linux
+          - platform: windows
+            runner: windows-latest
+            target: build-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: main
+          path: .cpa-main
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .cpa-main/go.mod
+          cache: true
+          cache-dependency-path: |
+            cpa-plugin/go.sum
+            .cpa-main/go.sum
+      - name: Download CPA modules
+        working-directory: .cpa-main
+        shell: bash
+        run: go mod download
+      - name: Point the plugin at checked-out CPA main
+        working-directory: cpa-plugin
+        shell: bash
+        run: go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7="${GITHUB_WORKSPACE}/.cpa-main"
+      - name: Download Go modules
+        working-directory: cpa-plugin
+        shell: bash
+        run: go mod download
+      - name: Build native shared library
+        working-directory: cpa-plugin
+        shell: bash
+        run: make ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aihub-auto-plugin-${{ matrix.platform }}
+          path: cpa-plugin/dist/
+          if-no-files-found: error

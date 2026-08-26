@@ -99,6 +99,25 @@ Linux x64 发行包使用 Bun 的 baseline CPU 目标，以兼容不支持 AVX2 
 x86-64 处理器；已验证 CentOS 7（glibc 2.17）和 Debian 9（glibc 2.24），
 不支持 glibc 2.12 及更早版本。完整矩阵见仓库安全审计报告。
 
+## CPA 插件部署（独立路径）
+
+[`cpa-plugin`](cpa-plugin) 是面向
+[CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的原生
+`c-shared` 插件部署路径。它由 CPA 进程动态加载，使用 CPA 的认证存储、宿主
+HTTP 传输和管理 API；安装、配置、兼容性基线以及平台限制见
+[cpa-plugin/README.md](cpa-plugin/README.md) 与
+[cpa-plugin/COMPATIBILITY.md](cpa-plugin/COMPATIBILITY.md)。
+
+CPA 插件和本项目的 Router/Tauri 桌面应用是**并列而非替代**的部署方式：
+
+- 选择 Router/Tauri 时，客户端仍连接本机 `http://127.0.0.1:8787/v1`，由
+  aihub-auto 管理本地登录、Key 池和桌面控制台。
+- 选择 CPA 时，将原生库放入 CPA 的 `plugins.dir`，由 CPA 负责进程、认证和
+  管理授权；不要同时把 CPA 插件当作 Router sidecar 或 Tauri 的替代二进制。
+
+CPA 插件当前只处理明确配置的模型路由和 CPA 提供的 AIHub 帐号/套餐候选元数据。
+空的 `model_patterns` 不会接管 CPA 内建路由，便于逐步启用。
+
 ## Koishi 查询插件
 
 [`koishi-plugin-aihub-auto`](packages/koishi-plugin-aihub-auto) 是独立的只读推荐插件，不会操作路由器或 AIHub Key：
