@@ -42,15 +42,17 @@ workflow rechecks the current CPA `main` using the current CPA Go toolchain.
    for HTTP, stream, and auth-save callbacks with simulated C-host responses:
 
    ```bash
+   go mod tidy
    go test -tags=cpa_dynamic_loader ./integration
    ```
 
-   At the recorded local CPA checkout, this tagged command is currently
-   blocked before compilation by CPA's own incomplete `go.sum` entry for
-   `github.com/sirupsen/logrus`, imported through
-   `internal/misc/antigravity_version.go`. Regular plugin tests, vet, and the
-   native build do not require that tagged integration package and remain part
-   of the required local verification.
+   The fixture requires cgo plus a native macOS or Linux toolchain because
+   CPA's public loader uses `dlopen` there; other platforms skip it. When a
+   newer CPA `main` adds or changes dependencies, resolve them with
+   `go mod tidy` inside this plugin first: a directory `replace` bypasses
+   CPA's own `go.sum`, so every transitive dependency must be recorded here.
+   The compatibility job in `.github/workflows/cpa-plugin.yml` runs that same
+   tidy step automatically before the fixture.
 
 3. Run `.github/workflows/cpa-plugin.yml` manually. Its compatibility job
    checks out CPA `main`, rewrites the local `replace` to that checkout, and
