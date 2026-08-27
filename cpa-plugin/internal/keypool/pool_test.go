@@ -3,8 +3,12 @@ package keypool
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/mimmer/aihub-auto/cpa-plugin/internal/aihub"
 )
 
 type recordingLifecycle struct {
@@ -16,11 +20,11 @@ func (lifecycle *recordingLifecycle) Create(_ context.Context, scope Scope) (Rem
 	lifecycle.created = append(lifecycle.created, scope)
 	return RemoteKey{ID: scope.AccountID + "-" + scope.Plan + "-" + string(scope.Pool) + "-" + string(rune(scope.GroupID)), Material: "runtime-only-secret"}, nil
 }
-func (lifecycle *recordingLifecycle) Delete(_ context.Context, remoteID string) error {
+func (lifecycle *recordingLifecycle) Delete(_ context.Context, _ Scope, remoteID string) error {
 	lifecycle.deleted = append(lifecycle.deleted, remoteID)
 	return nil
 }
-func (lifecycle *recordingLifecycle) Exists(_ context.Context, remoteID string) (bool, error) {
+func (lifecycle *recordingLifecycle) Exists(_ context.Context, _ Scope, remoteID string) (bool, error) {
 	return remoteID != "missing", nil
 }
 
@@ -85,6 +89,47 @@ func TestNoopLifecycleNeverInventsRemoteKeyCalls(t *testing.T) {
 	_, errAllocate := pool.Allocate(context.Background(), Scope{AccountID: "account", Plan: "pro", Pool: DefaultPool, GroupID: 1}, time.Now())
 	if errAllocate == nil {
 		t.Fatal("Allocate() error = nil, want explicit unavailable lifecycle")
+	}
+}
+
+func TestAIHubLifecycleCreatesAndDeletesManagedKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer account-token" {
+			t.Fatalf("Authorization = %q, want account bearer token", request.Header.Get("Authorization"))
+		}
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/keys":
+			_, _ = responseWriter.Write([]byte(`{"code":0,"data":{"id":"key-1","key":"sk-managed","group_id":3}}`))
+		case request.Method == http.MethodDelete && request.URL.Path == "/api/v1/keys/key-1":
+			_, _ = responseWriter.Write([]byte(`{"code":0,"data":{"message":"deleted"}}`))
+		default:
+			t.Fatalf("unexpected %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	tokens := NewRuntimeTokenStore()
+	tokens.Put("account", "account-token")
+	lifecycle := NewAIHubLifecycle(aihub.NewClient(server.URL, nil), tokens)
+	scope := Scope{AccountID: "account", Plan: "pro", Pool: DefaultPool, GroupID: 3}
+
+	key, errCreate := lifecycle.Create(context.Background(), scope)
+	if errCreate != nil || key.ID != "key-1" || key.Material != "sk-managed" {
+		t.Fatalf("Create() = %#v, %v; want managed key", key, errCreate)
+	}
+	if errDelete := lifecycle.Delete(context.Background(), scope, key.ID); errDelete != nil {
+		t.Fatalf("Delete() error = %v", errDelete)
+	}
+}
+
+func TestAIHubLifecycleRequiresAccountToken(t *testing.T) {
+	lifecycle := NewAIHubLifecycle(aihub.NewClient("https://aihub.example", nil), NewRuntimeTokenStore())
+	scope := Scope{AccountID: "account", Plan: "pro", Pool: DefaultPool, GroupID: 1}
+	if _, errCreate := lifecycle.Create(context.Background(), scope); errCreate == nil {
+		t.Fatal("Create() error = nil, want missing token error")
+	}
+	if errDelete := lifecycle.Delete(context.Background(), scope, "key-1"); errDelete == nil {
+		t.Fatal("Delete() error = nil, want missing token error")
 	}
 }
 

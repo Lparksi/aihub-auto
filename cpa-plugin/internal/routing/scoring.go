@@ -40,7 +40,15 @@ func scoreCandidate(candidate Candidate, options SelectionOptions) ScoredCandida
 	case ModeSpeed:
 		priceWeight, latencyWeight = .2, .8
 	}
-	return ScoredCandidate{Candidate: candidate, Score: -(priceWeight*candidate.Rate + latencyWeight*(ttft/10_000)) - (1 - successRate), SuccessRate: successRate, Samples: observation.Samples}
+	rate := candidate.Rate
+	if options.CloudStats != nil {
+		if modelPrices, ok := options.CloudStats.Prices[candidate.Key.GroupID]; ok {
+			if price, ok := modelPrices[strings.ToLower(strings.TrimSpace(options.Model))]; ok && price >= 0 {
+				rate = price
+			}
+		}
+	}
+	return ScoredCandidate{Candidate: candidate, Score: -(priceWeight*rate + latencyWeight*(ttft/10_000)) - (1 - successRate), SuccessRate: successRate, Samples: observation.Samples}
 }
 
 func Select(candidates []Candidate, options SelectionOptions) Selection {
@@ -58,6 +66,14 @@ func Select(candidates []Candidate, options SelectionOptions) Selection {
 		if !candidate.Available {
 			selection.Excluded = append(selection.Excluded, ExcludedCandidate{candidate, "unavailable"})
 			continue
+		}
+		if options.CloudStats != nil {
+			if modelHealth, ok := options.CloudStats.Health[candidate.Key.GroupID]; ok {
+				if healthy, known := modelHealth[strings.ToLower(strings.TrimSpace(options.Model))]; known && !healthy {
+					selection.Excluded = append(selection.Excluded, ExcludedCandidate{candidate, "model_unavailable"})
+					continue
+				}
+			}
 		}
 		if candidate.Rate < options.PriceBand.Min || candidate.Rate > options.PriceBand.Max {
 			selection.Excluded = append(selection.Excluded, ExcludedCandidate{candidate, "price_band"})

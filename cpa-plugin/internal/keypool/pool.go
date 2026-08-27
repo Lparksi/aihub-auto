@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mimmer/aihub-auto/cpa-plugin/internal/aihub"
 	"github.com/mimmer/aihub-auto/cpa-plugin/internal/state"
 )
 
@@ -33,16 +34,91 @@ type RemoteKey struct {
 }
 type Lifecycle interface {
 	Create(context.Context, Scope) (RemoteKey, error)
-	Delete(context.Context, string) error
-	Exists(context.Context, string) (bool, error)
+	Delete(context.Context, Scope, string) error
+	Exists(context.Context, Scope, string) (bool, error)
 }
 type NoopLifecycle struct{}
 
 func (NoopLifecycle) Create(context.Context, Scope) (RemoteKey, error) {
 	return RemoteKey{}, errors.New("AIHub key lifecycle endpoint is unconfirmed")
 }
-func (NoopLifecycle) Delete(context.Context, string) error         { return nil }
-func (NoopLifecycle) Exists(context.Context, string) (bool, error) { return true, nil }
+func (NoopLifecycle) Delete(context.Context, Scope, string) error         { return nil }
+func (NoopLifecycle) Exists(context.Context, Scope, string) (bool, error) { return true, nil }
+
+// TokenStore holds account access tokens in memory only. Tokens are never
+// persisted and never leave the process.
+type TokenStore interface {
+	Get(accountID string) string
+	Put(accountID, token string)
+}
+
+// RuntimeTokenStore is the default in-memory token store.
+type RuntimeTokenStore struct {
+	mutex    sync.Mutex
+	tokens   map[string]string
+}
+
+func NewRuntimeTokenStore() *RuntimeTokenStore {
+	return &RuntimeTokenStore{tokens: map[string]string{}}
+}
+func (store *RuntimeTokenStore) Get(accountID string) string {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	return store.tokens[accountID]
+}
+func (store *RuntimeTokenStore) Put(accountID, token string) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if accountID != "" && token != "" {
+		store.tokens[accountID] = token
+	}
+}
+
+// AIHubLifecycle creates, deletes, and checks managed AIHub API keys using the
+// account bearer token held in the token store. Key material is returned only
+// through RemoteKey and is never logged or persisted.
+type AIHubLifecycle struct {
+	client *aihub.Client
+	tokens TokenStore
+}
+
+func NewAIHubLifecycle(client *aihub.Client, tokens TokenStore) *AIHubLifecycle {
+	return &AIHubLifecycle{client: client, tokens: tokens}
+}
+
+func (lifecycle *AIHubLifecycle) Create(ctx context.Context, scope Scope) (RemoteKey, error) {
+	token := lifecycle.tokens.Get(scope.AccountID)
+	if token == "" {
+		return RemoteKey{}, errors.New("account bearer token is unavailable for key creation")
+	}
+	key, errCreate := lifecycle.client.CreateKey(ctx, token, managedKeyName(scope), scope.GroupID)
+	if errCreate != nil {
+		return RemoteKey{}, errCreate
+	}
+	return RemoteKey{ID: key.ID, Material: key.Material}, nil
+}
+func (lifecycle *AIHubLifecycle) Delete(ctx context.Context, scope Scope, remoteID string) error {
+	token := lifecycle.tokens.Get(scope.AccountID)
+	if token == "" {
+		return errors.New("account bearer token is unavailable for key deletion")
+	}
+	return lifecycle.client.DeleteKey(ctx, token, remoteID)
+}
+func (lifecycle *AIHubLifecycle) Exists(ctx context.Context, scope Scope, remoteID string) (bool, error) {
+	token := lifecycle.tokens.Get(scope.AccountID)
+	if token == "" {
+		return false, errors.New("account bearer token is unavailable for key reconciliation")
+	}
+	return lifecycle.client.KeyExists(ctx, token, remoteID)
+}
+
+func managedKeyName(scope Scope) string {
+	prefix := "aihub-auto-g"
+	if scope.Pool == LunaPool {
+		prefix = "aihub-auto-luna-g"
+	}
+	return prefix + strconv.Itoa(scope.GroupID)
+}
 
 type MaterialStore interface {
 	Get(Scope) string
@@ -148,6 +224,23 @@ func (manager *PoolManager) Metadata(scope Scope) KeyMetadata {
 	return manager.metadata[scope]
 }
 
+// Invalidate removes a managed key from the pool and deletes it upstream. It is
+// used when an upstream 401 proves the key was revoked. The lease identifies
+// the exact scope and remote key to remove.
+func (manager *PoolManager) Invalidate(ctx context.Context, lease Lease) error {
+	manager.mutex.Lock()
+	defer manager.mutex.Unlock()
+	if lease.Scope == (Scope{}) || lease.ID == "" {
+		return nil
+	}
+	if errDelete := manager.options.Lifecycle.Delete(ctx, lease.Scope, lease.ID); errDelete != nil {
+		return errDelete
+	}
+	delete(manager.metadata, lease.Scope)
+	manager.options.Materials.Delete(lease.Scope)
+	return nil
+}
+
 // Summary reports aggregate non-secret metadata for the two runtime pools.
 func (manager *PoolManager) Summary() (defaultEntries, lunaEntries, defaultCapacity, lunaCapacity int, lifecycleConfirmed bool) {
 	manager.mutex.Lock()
@@ -198,7 +291,7 @@ func (manager *PoolManager) Reconcile(ctx context.Context) (int, error) {
 	defer manager.mutex.Unlock()
 	removed := 0
 	for scope, metadata := range manager.metadata {
-		exists, errExists := manager.options.Lifecycle.Exists(ctx, metadata.ID)
+		exists, errExists := manager.options.Lifecycle.Exists(ctx, scope, metadata.ID)
 		if errExists != nil {
 			return removed, errExists
 		}
@@ -234,7 +327,7 @@ func (manager *PoolManager) evictLocked(ctx context.Context, active Scope, _ tim
 	for len(candidates)+1 > manager.capacity(active.Pool) {
 		victim := candidates[0]
 		candidates = candidates[1:]
-		if errDelete := manager.options.Lifecycle.Delete(ctx, victim.ID); errDelete != nil {
+		if errDelete := manager.options.Lifecycle.Delete(ctx, victim.Scope, victim.ID); errDelete != nil {
 			return errDelete
 		}
 		delete(manager.metadata, victim.Scope)

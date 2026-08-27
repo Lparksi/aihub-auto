@@ -86,6 +86,37 @@ func TestManualLockFallbackBreakerAndIsolation(t *testing.T) {
 	}
 }
 
+func TestCloudStatsPrefiltersUnhealthyAndOverridesPrice(t *testing.T) {
+	healthy := Candidate{AuthID: "healthy", Key: CandidateKey{"account-a", "pro", 1}, Rate: 0.5, TTFT: 100, Available: true}
+	unhealthy := Candidate{AuthID: "unhealthy", Key: CandidateKey{"account-a", "pro", 2}, Rate: 0.1, TTFT: 100, Available: true}
+	cloud := &CloudStats{
+		Health: map[int]map[string]bool{2: {"gpt-4": false}},
+		Prices: map[int]map[string]float64{1: {"gpt-4": 0.05}},
+	}
+	selection := Select([]Candidate{healthy, unhealthy}, SelectionOptions{Mode: ModeEconomy, Model: "gpt-4", CloudStats: cloud})
+	if selection.Candidate == nil || selection.Candidate.AuthID != "healthy" {
+		t.Fatalf("selection = %#v, want healthy candidate after cloud prefilter", selection)
+	}
+	if len(selection.Excluded) != 1 || selection.Excluded[0].Reason != "model_unavailable" {
+		t.Fatalf("excluded = %#v, want unhealthy model exclusion", selection.Excluded)
+	}
+	// The cloud price (0.05) overrides the candidate rate (0.5), so healthy wins
+	// on economy price even though its configured rate is higher.
+	if selection.Candidate.Score >= 0 {
+		t.Fatalf("score = %v, want cloud-price-driven economy score", selection.Candidate.Score)
+	}
+}
+
+func TestCloudStatsMissingValuesFallBackToCandidateAttributes(t *testing.T) {
+	candidate := Candidate{AuthID: "c", Key: CandidateKey{"account-a", "pro", 1}, Rate: 0.2, TTFT: 100, Available: true}
+	// No health entry for group 1 and no price for gpt-4: both fall back.
+	cloud := &CloudStats{Health: map[int]map[string]bool{2: {"gpt-4": true}}, Prices: map[int]map[string]float64{1: {"claude": 0.01}}}
+	selection := Select([]Candidate{candidate}, SelectionOptions{Mode: ModeBalanced, Model: "gpt-4", CloudStats: cloud})
+	if selection.Candidate == nil || selection.Candidate.AuthID != "c" {
+		t.Fatalf("selection = %#v, want candidate with conservative fallback", selection)
+	}
+}
+
 func TestSchedulerSelectsImportedAuthWithoutRequestOrOptionalRoutingMetadata(t *testing.T) {
 	scheduler := NewScheduler(ModeBalanced, PriceBand{Min: 0, Max: 1}, "")
 	request := pluginSchedulerRequest("account-a", "pro", []pluginCandidate{

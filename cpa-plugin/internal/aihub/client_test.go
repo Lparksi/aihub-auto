@@ -82,6 +82,40 @@ func TestModelsSendsAuthorizationAndParsesCatalog(t *testing.T) {
 	}
 }
 
+func TestProviderStatsParsesHealthPricesAndCacheHitRate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/v1/public/providers" {
+			t.Fatalf("path = %q, want public providers", request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Fatalf("Authorization = %q, want anonymous request", request.Header.Get("Authorization"))
+		}
+		_, _ = responseWriter.Write([]byte(`{"code":0,"data":[{"group_id":1,"available":true,"cache_hit_rate":"88.03%","model_health":{"gpt-4":true,"gpt-4o":false},"model_prices":{"gpt-4":0.05,"gpt-4o":0.1}},{"group_id":2,"available":false}]}`))
+	}))
+	defer server.Close()
+
+	stats, errStats := NewClient(server.URL, nil).ProviderStats(context.Background())
+	if errStats != nil {
+		t.Fatalf("ProviderStats() error = %v", errStats)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("ProviderStats() = %#v, want two entries", stats)
+	}
+	first := stats[0]
+	if first.GroupID != 1 || !first.Available || first.CacheHitRate != 0.8803 {
+		t.Fatalf("first stat = %#v, want parsed cache hit rate", first)
+	}
+	if !first.ModelHealth["gpt-4"] || first.ModelHealth["gpt-4o"] {
+		t.Fatalf("model health = %#v, want per-model health", first.ModelHealth)
+	}
+	if first.ModelPrices["gpt-4"] != 0.05 || first.ModelPrices["gpt-4o"] != 0.1 {
+		t.Fatalf("model prices = %#v, want per-model prices", first.ModelPrices)
+	}
+	if stats[1].Available {
+		t.Fatalf("second stat = %#v, want unavailable", stats[1])
+	}
+}
+
 func TestClientUsesProvidedHostHTTPClient(t *testing.T) {
 	hostClient := &recordingHostHTTPClient{response: pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"data":[{"id":"model-a"}]}`)}}
 	models, errModels := NewClientWithHostHTTPClient("https://aihub.example", hostClient).Models(context.Background(), "access-token")

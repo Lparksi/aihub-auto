@@ -161,6 +161,9 @@ state_dir: ""
 default_pool_size: 4
 luna_pool_size: 4
 session_ttl: 24h
+key_mode: single
+use_cloud_stats: false
+cloud_stats_ttl: 60s
 ```
 
 `enabled` and `priority` are CPA-owned fields. The plugin accepts them because
@@ -175,10 +178,12 @@ removing a trailing slash.
 mutation bodies. It must be positive and defaults to 4 MiB; the native ABI also
 rejects requests larger than this default before copying them out of C memory.
 
-`max_response_bytes` caps both normal and stream executor bodies. CPA's ABI
-does expose host stream reads, but the phase-two executor response remains the
-ABI-prescribed buffered chunk envelope; SSE is therefore buffered up to this
-limit before it is returned. Oversized responses fail safely.
+`max_response_bytes` caps both normal and stream executor bodies. Streaming
+executor responses are pushed to CPA's host stream bridge chunk-by-chunk as
+they arrive (first token is not buffered); when the total exceeds this limit the
+stream is terminated with an error instead of being buffered. Non-streaming
+responses remain bounded to this limit before they are returned. Oversized
+responses fail safely.
 
 `mode` controls actual candidate scoring: `economy` favors the lowest healthy
 price tier, `balanced` weights price and first-token latency equally, and
@@ -232,14 +237,32 @@ and Responses aliases are removed. A stream may select a fallback only before
 output starts; a broken post-output stream clears affinity instead of replaying
 partial output.
 
-The phase-four packages provide persistence and lifecycle-safe algorithms;
-the currently available CPA executor request schema exposes only the selected
-auth's `StorageJSON` and does not provide host APIs for creating, listing, or
-storing additional API keys. Key creation, mutation, list, and deletion remain
-intentionally deferred until a confirmed CPA auth-storage/lifecycle contract is
-available. Existing confirmed AIHub calls remain exactly: `POST /api/v1/auth/login`,
-`POST /api/v1/auth/refresh`, `GET /api/v1/auth/me`, `GET /v1/models`, and
-`POST /v1/chat/completions`.
+`key_mode` selects how the executor authenticates upstream. `single` (the
+default) uses the imported account bearer token directly, matching the original
+pass-through behavior. `pool` creates and manages a per-`(account, plan, pool,
+group)` AIHub API key through `/api/v1/keys`, uses that key's plaintext as the
+upstream bearer, and deletes it when the pool rotates or an upstream 401 proves
+it was revoked. Account bearer tokens are cached in memory only and are never
+persisted or logged; the durable state snapshot still stores only non-secret
+key metadata. `pool` requires the scheduler to supply `aihub_auto_group_id`
+(and account/plan) attributes on the executor request.
+
+`use_cloud_stats` (default `false`) enables best-effort routing from AIHub's
+public `/api/v1/public/providers` catalog: `model_health` pre-filters unhealthy
+group/model combinations and `model_prices` overrides the candidate rate for
+cost ordering. The semantics of these fields are not yet confirmed, so missing
+values fall back to the candidate's own attributes and the feature is off by
+default. `cloud_stats_ttl` (default `60s`) bounds how often the catalog is
+refetched.
+
+The phase-four packages provide persistence and lifecycle-safe algorithms. With
+`key_mode: pool`, the plugin creates, lists, and deletes managed AIHub API keys
+through the confirmed `/api/v1/keys` endpoints. With the default `key_mode:
+single`, no key lifecycle operations are performed and the executor uses the
+imported account token directly. Existing confirmed AIHub calls remain exactly:
+`POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`, `GET /api/v1/auth/me`,
+`GET /v1/models`, `POST /v1/chat/completions`, plus `GET/POST/DELETE
+/api/v1/keys` in pool mode.
 
 Configuration has no secret, token, password, or API-key fields. Future auth
 integration must use CPA's auth store rather than plugin configuration.

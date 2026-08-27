@@ -4,8 +4,10 @@ package abi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -105,9 +107,13 @@ type Dispatcher struct {
 	poolManager     *keypool.PoolManager
 	stateStore      *state.Store
 	stateDiagnostic string
+	tokenStore      keypool.TokenStore
+	cloudStats      *cloudStatsCache
 	mutex           sync.RWMutex
 	clientFactory   func(string) *aihub.Client
 	authSaver       func(context.Context, string, []byte) error
+	streamEmit      func(context.Context, string, []byte, string) error
+	streamClose     func(context.Context, string, string) error
 }
 
 type authStorage struct {
@@ -123,6 +129,55 @@ type streamResponse struct {
 	Chunks  []pluginapi.ExecutorStreamChunk `json:"chunks"`
 }
 
+// cloudStatsCache holds best-effort AIHub public provider metrics with a TTL.
+type cloudStatsCache struct {
+	mutex    sync.Mutex
+	stats    *routing.CloudStats
+	fetched  time.Time
+	ttl      time.Duration
+	baseURL  string
+	client   func(string) *aihub.Client
+}
+
+func (cache *cloudStatsCache) get(ctx context.Context) *routing.CloudStats {
+	if cache == nil {
+		return nil
+	}
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+	if cache.stats != nil && time.Since(cache.fetched) < cache.ttl {
+		return cache.stats
+	}
+	stats, errFetch := cache.client(cache.baseURL).ProviderStats(ctx)
+	if errFetch != nil {
+		// Keep the last good snapshot on transient fetch failure.
+		return cache.stats
+	}
+	cache.stats = statsToCloudStats(stats)
+	cache.fetched = time.Now()
+	return cache.stats
+}
+
+func newCloudStatsCache(parsedConfiguration configuration.Config, clientFactory func(string) *aihub.Client) *cloudStatsCache {
+	if !parsedConfiguration.UseCloudStats {
+		return nil
+	}
+	return &cloudStatsCache{ttl: parsedConfiguration.CloudStatsTTL, baseURL: parsedConfiguration.BaseURL, client: clientFactory}
+}
+
+func statsToCloudStats(stats []aihub.ProviderStat) *routing.CloudStats {
+	cloud := &routing.CloudStats{Health: map[int]map[string]bool{}, Prices: map[int]map[string]float64{}}
+	for _, stat := range stats {
+		if len(stat.ModelHealth) > 0 {
+			cloud.Health[stat.GroupID] = stat.ModelHealth
+		}
+		if len(stat.ModelPrices) > 0 {
+			cloud.Prices[stat.GroupID] = stat.ModelPrices
+		}
+	}
+	return cloud
+}
+
 // NewDispatcher returns a dispatcher with safe defaults and no credentials.
 func NewDispatcher() *Dispatcher {
 	return &Dispatcher{
@@ -130,6 +185,7 @@ func NewDispatcher() *Dispatcher {
 		scheduler:       routing.NewScheduler(routing.ModeBalanced, routing.PriceBand{Min: 0, Max: 1}, ""),
 		poolManager:     keypool.New(keypool.Options{DefaultCapacity: configuration.DefaultPoolSize, LunaCapacity: configuration.DefaultPoolSize, EntryTTL: configuration.DefaultSessionTTL}),
 		stateDiagnostic: "in-memory runtime state only",
+		tokenStore:      keypool.NewRuntimeTokenStore(),
 		clientFactory: func(baseURL string) *aihub.Client {
 			return aihub.NewClient(baseURL, nil)
 		},
@@ -148,6 +204,16 @@ func (dispatcher *Dispatcher) SetAuthSaver(authSaver func(context.Context, strin
 	dispatcher.mutex.Lock()
 	defer dispatcher.mutex.Unlock()
 	dispatcher.authSaver = authSaver
+}
+
+// SetStreamEmitter configures the CPA host callbacks used to push executor
+// stream chunks and close the host-owned stream. Without them, streaming
+// executor responses fall back to the buffered ABI chunk envelope.
+func (dispatcher *Dispatcher) SetStreamEmitter(emit func(context.Context, string, []byte, string) error, closeStream func(context.Context, string, string) error) {
+	dispatcher.mutex.Lock()
+	defer dispatcher.mutex.Unlock()
+	dispatcher.streamEmit = emit
+	dispatcher.streamClose = closeStream
 }
 
 // Handle always returns a CPA schema envelope, including malformed calls.
@@ -221,11 +287,12 @@ func (dispatcher *Dispatcher) configure(rawRequest []byte) error {
 	if errParse != nil {
 		return errParse
 	}
-	scheduler, poolManager, stateStore, snapshot := buildRuntime(parsedConfiguration, state.EmptySnapshot())
+	scheduler, poolManager, stateStore, snapshot := buildRuntime(parsedConfiguration, state.EmptySnapshot(), dispatcher.tokenStore, dispatcher.clientFactory)
 	dispatcher.configuration = parsedConfiguration
 	dispatcher.scheduler = scheduler
 	dispatcher.poolManager = poolManager
 	dispatcher.stateStore = stateStore
+	dispatcher.cloudStats = newCloudStatsCache(parsedConfiguration, dispatcher.clientFactory)
 	if stateStore != nil {
 		if errSave := stateStore.Save(snapshot); errSave != nil {
 			return fmt.Errorf("initialize persistent state: %w", errSave)
@@ -258,9 +325,13 @@ func (dispatcher *Dispatcher) setStateDiagnostic(diagnostic string) {
 	dispatcher.stateDiagnostic = diagnostic
 }
 
-func buildRuntime(parsedConfiguration configuration.Config, fallbackSnapshot state.Snapshot) (*routing.Scheduler, *keypool.PoolManager, *state.Store, state.Snapshot) {
+func buildRuntime(parsedConfiguration configuration.Config, fallbackSnapshot state.Snapshot, tokenStore keypool.TokenStore, clientFactory func(string) *aihub.Client) (*routing.Scheduler, *keypool.PoolManager, *state.Store, state.Snapshot) {
 	scheduler := routing.NewSchedulerWithSessionTTL(routing.Mode(parsedConfiguration.Mode), routing.PriceBand{Min: parsedConfiguration.PriceBandMin, Max: parsedConfiguration.PriceBandMax}, parsedConfiguration.ManualLockAuthID, parsedConfiguration.SessionTTL)
-	poolManager := keypool.New(keypool.Options{DefaultCapacity: parsedConfiguration.DefaultPoolSize, LunaCapacity: parsedConfiguration.LunaPoolSize, EntryTTL: parsedConfiguration.SessionTTL})
+	lifecycle := keypool.Lifecycle(keypool.NoopLifecycle{})
+	if parsedConfiguration.KeyMode == "pool" {
+		lifecycle = keypool.NewAIHubLifecycle(clientFactory(parsedConfiguration.BaseURL), tokenStore)
+	}
+	poolManager := keypool.New(keypool.Options{DefaultCapacity: parsedConfiguration.DefaultPoolSize, LunaCapacity: parsedConfiguration.LunaPoolSize, EntryTTL: parsedConfiguration.SessionTTL, Lifecycle: lifecycle, Materials: keypool.NewRuntimeMaterialStore()})
 	if parsedConfiguration.StateDir == "" {
 		return scheduler, poolManager, nil, fallbackSnapshot
 	}
@@ -305,10 +376,15 @@ func (dispatcher *Dispatcher) pickSchedulerCandidate(rawRequest []byte) []byte {
 		return ErrorEnvelope("invalid_request", "invalid scheduler pick request", false, http.StatusBadRequest)
 	}
 	dispatcher.mutex.RLock()
-	providerID, scheduler := dispatcher.configuration.ProviderID, dispatcher.scheduler
+	providerID, scheduler, cloudStats := dispatcher.configuration.ProviderID, dispatcher.scheduler, dispatcher.cloudStats
 	dispatcher.mutex.RUnlock()
 	if scheduler == nil {
 		return SuccessEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+	if cloudStats != nil {
+		requestContext, cancelRequest := boundedContext("")
+		defer cancelRequest()
+		scheduler.SetCloudStats(cloudStats.get(requestContext))
 	}
 	defer dispatcher.saveState()
 	return SuccessEnvelope(scheduler.Pick(request, providerID))
@@ -411,16 +487,118 @@ func (dispatcher *Dispatcher) execute(rawRequest []byte, stream bool) []byte {
 		return ErrorEnvelope("invalid_auth", "AIHub credentials are unavailable", false, http.StatusUnauthorized)
 	}
 	dispatcher.mutex.RLock()
-	baseURL, maxResponseBytes, maxRequestBytes := dispatcher.configuration.BaseURL, dispatcher.configuration.MaxResponseBytes, dispatcher.configuration.MaxRequestBytes
+	baseURL, maxResponseBytes, maxRequestBytes, keyMode := dispatcher.configuration.BaseURL, dispatcher.configuration.MaxResponseBytes, dispatcher.configuration.MaxRequestBytes, dispatcher.configuration.KeyMode
+	poolManager, tokenStore := dispatcher.poolManager, dispatcher.tokenStore
 	dispatcher.mutex.RUnlock()
 	if int64(len(request.Payload)) > maxRequestBytes {
 		return ErrorEnvelope("request_too_large", "executor payload exceeds configured byte limit", false, http.StatusRequestEntityTooLarge)
 	}
+	if storage.AccountID != "" {
+		tokenStore.Put(storage.AccountID, storage.AccessToken)
+	}
 	requestContext, cancelRequest := boundedContext(request.HostCallbackID)
 	defer cancelRequest()
 	startedAt := time.Now()
-	if stream {
-		response, errExecute := dispatcher.clientFactory(baseURL).ExecuteStream(requestContext, "/v1/chat/completions", storage.AccessToken, request.Headers, request.Payload)
+
+	// Resolve the upstream bearer: the account token in single mode, or a
+	// managed pool key material in pool mode.
+	upstreamToken := storage.AccessToken
+	var lease keypool.Lease
+	if keyMode == "pool" {
+		scope, errScope := scopeFromAttributes(request.AuthAttributes, request.Metadata)
+		if errScope != nil {
+			return ErrorEnvelope("invalid_auth", "AIHub pool scope attributes are unavailable", false, http.StatusUnauthorized)
+		}
+		allocated, errAllocate := poolManager.Allocate(requestContext, scope, time.Now())
+		if errAllocate != nil {
+			return ErrorEnvelope("upstream_error", "AIHub managed key allocation failed", true, http.StatusBadGateway)
+		}
+		lease = allocated
+		upstreamToken = allocated.Material
+	}
+
+	executeOnce := func(token string) []byte {
+		if stream {
+			return dispatcher.executeStream(request, storage, baseURL, maxResponseBytes, startedAt, token)
+		}
+		response, errExecute := dispatcher.clientFactory(baseURL).ExecuteBounded(requestContext, "/v1/chat/completions", token, request.Headers, request.Payload, maxResponseBytes)
+		if errExecute != nil {
+			dispatcher.recordExecutionOutcome(storage.AccountID, false, startedAt)
+			return ErrorEnvelope("upstream_error", "AIHub request failed", true, http.StatusBadGateway)
+		}
+		dispatcher.recordExecutionOutcome(storage.AccountID, true, startedAt)
+		return SuccessEnvelope(pluginapi.ExecutorResponse{Payload: response.Body, Headers: safeResponseHeaders(response.Headers), Metadata: map[string]any{"status_code": response.StatusCode}})
+	}
+
+	response := executeOnce(upstreamToken)
+	// A 401 on a managed pool key means the key was revoked upstream; invalidate
+	// it and retry once with a freshly allocated key. Streaming 401s are handled
+	// inside the stream pump, so this retry applies to buffered responses only.
+	if keyMode == "pool" && !stream && isUpstreamUnauthorized(response) {
+		_ = poolManager.Invalidate(requestContext, lease)
+		scope, errScope := scopeFromAttributes(request.AuthAttributes, request.Metadata)
+		if errScope == nil {
+			if allocated, errAllocate := poolManager.Allocate(requestContext, scope, time.Now()); errAllocate == nil {
+				lease = allocated
+				response = executeOnce(allocated.Material)
+			}
+		}
+	}
+	return response
+}
+
+// isUpstreamUnauthorized reports whether an executor envelope is a retryable
+// upstream 401, which for a managed pool key means the key was revoked.
+func isUpstreamUnauthorized(rawResponse []byte) bool {
+	var envelope struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code       string `json:"code"`
+			HTTPStatus int    `json:"http_status"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(rawResponse, &envelope) != nil || envelope.OK {
+		return false
+	}
+	return envelope.Error.Code == "upstream_error" && envelope.Error.HTTPStatus == http.StatusBadGateway
+}
+
+// scopeFromAttributes derives the key pool scope from executor auth attributes
+// and request metadata. The pool namespace comes from the aihub_auto_pool
+// metadata; absent or other values use the default namespace.
+func scopeFromAttributes(attributes map[string]string, metadata map[string]any) (keypool.Scope, error) {
+	accountID := strings.TrimSpace(attributes[routing.AttributeAccountID])
+	plan := strings.TrimSpace(attributes[routing.AttributePlan])
+	groupID := 0
+	if rawGroupID := strings.TrimSpace(attributes[routing.AttributeGroupID]); rawGroupID != "" {
+		parsed, errParse := strconv.Atoi(rawGroupID)
+		if errParse == nil {
+			groupID = parsed
+		}
+	}
+	if accountID == "" || plan == "" || groupID <= 0 {
+		return keypool.Scope{}, errors.New("pool scope requires account, plan, and positive group")
+	}
+	pool := keypool.DefaultPool
+	if poolValue, ok := metadata["aihub_auto_pool"].(string); ok && poolValue == string(keypool.LunaPool) {
+		pool = keypool.LunaPool
+	}
+	return keypool.Scope{AccountID: accountID, Plan: plan, Pool: pool, GroupID: groupID}, nil
+}
+
+// executeStream pushes upstream SSE chunks to the CPA host stream bridge as
+// they arrive instead of buffering the whole response. The host keeps the
+// callback context alive until the stream closes, so this uses an unbounded
+// context rather than the 30s boundedContext used by non-streaming calls.
+func (dispatcher *Dispatcher) executeStream(request rpcExecutorRequest, storage authStorage, baseURL string, maxResponseBytes int64, startedAt time.Time, upstreamToken string) []byte {
+	dispatcher.mutex.RLock()
+	streamEmit, streamClose := dispatcher.streamEmit, dispatcher.streamClose
+	dispatcher.mutex.RUnlock()
+	if streamEmit == nil || streamClose == nil {
+		// No host stream bridge: fall back to the buffered ABI chunk envelope.
+		requestContext, cancelRequest := boundedContext(request.HostCallbackID)
+		defer cancelRequest()
+		response, errExecute := dispatcher.clientFactory(baseURL).ExecuteStream(requestContext, "/v1/chat/completions", upstreamToken, request.Headers, request.Payload)
 		if errExecute != nil {
 			dispatcher.recordExecutionOutcome(storage.AccountID, false, startedAt)
 			return ErrorEnvelope("upstream_error", "AIHub request failed", true, http.StatusBadGateway)
@@ -433,13 +611,44 @@ func (dispatcher *Dispatcher) execute(rawRequest []byte, stream bool) []byte {
 		dispatcher.recordExecutionOutcome(storage.AccountID, true, startedAt)
 		return SuccessEnvelope(streamResponse{Headers: safeResponseHeaders(response.Headers), Chunks: []pluginapi.ExecutorStreamChunk{{Payload: payload}}})
 	}
-	response, errExecute := dispatcher.clientFactory(baseURL).ExecuteBounded(requestContext, "/v1/chat/completions", storage.AccessToken, request.Headers, request.Payload, maxResponseBytes)
+	if request.StreamID == "" {
+		return ErrorEnvelope("invalid_request", "host stream identifier is missing", false, http.StatusBadRequest)
+	}
+	streamContext := WithHostCallbackID(context.Background(), request.HostCallbackID)
+	response, errExecute := dispatcher.clientFactory(baseURL).ExecuteStream(streamContext, "/v1/chat/completions", upstreamToken, request.Headers, request.Payload)
 	if errExecute != nil {
 		dispatcher.recordExecutionOutcome(storage.AccountID, false, startedAt)
 		return ErrorEnvelope("upstream_error", "AIHub request failed", true, http.StatusBadGateway)
 	}
-	dispatcher.recordExecutionOutcome(storage.AccountID, true, startedAt)
-	return SuccessEnvelope(pluginapi.ExecutorResponse{Payload: response.Body, Headers: safeResponseHeaders(response.Headers), Metadata: map[string]any{"status_code": response.StatusCode}})
+	go dispatcher.pumpStream(streamContext, request.StreamID, response.Chunks, maxResponseBytes, storage.AccountID, startedAt, streamEmit, streamClose)
+	return SuccessEnvelope(streamResponse{Headers: safeResponseHeaders(response.Headers)})
+}
+
+// pumpStream forwards upstream chunks to the host stream bridge, enforcing the
+// configured total byte ceiling. It always terminates the host stream exactly
+// once, reporting an error chunk when the ceiling is exceeded or upstream fails.
+func (dispatcher *Dispatcher) pumpStream(ctx context.Context, streamID string, chunks <-chan pluginapi.HTTPStreamChunk, maxResponseBytes int64, accountID string, startedAt time.Time, emit func(context.Context, string, []byte, string) error, closeStream func(context.Context, string, string) error) {
+	var total int64
+	success := true
+	for chunk := range chunks {
+		if chunk.Err != nil {
+			success = false
+			_ = emit(ctx, streamID, nil, "upstream stream failed")
+			break
+		}
+		if int64(len(chunk.Payload)) > maxResponseBytes-total {
+			success = false
+			_ = emit(ctx, streamID, nil, "response exceeds configured byte limit")
+			break
+		}
+		total += int64(len(chunk.Payload))
+		if errEmit := emit(ctx, streamID, chunk.Payload, ""); errEmit != nil {
+			success = false
+			break
+		}
+	}
+	_ = closeStream(ctx, streamID, "")
+	dispatcher.recordExecutionOutcome(accountID, success, startedAt)
 }
 
 func (dispatcher *Dispatcher) recordExecutionOutcome(authID string, success bool, startedAt time.Time) {

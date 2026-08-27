@@ -37,6 +37,9 @@ type Config struct {
 	DefaultPoolSize   int           `yaml:"default_pool_size"`
 	LunaPoolSize      int           `yaml:"luna_pool_size"`
 	SessionTTL        time.Duration `yaml:"session_ttl"`
+	KeyMode           string        `yaml:"key_mode"`
+	UseCloudStats     bool          `yaml:"use_cloud_stats"`
+	CloudStatsTTL     time.Duration `yaml:"cloud_stats_ttl"`
 }
 
 // rawConfig includes the fields CPA owns as well as this plugin's settings.
@@ -59,6 +62,9 @@ type rawConfig struct {
 	DefaultPoolSize   int           `yaml:"default_pool_size"`
 	LunaPoolSize      int           `yaml:"luna_pool_size"`
 	SessionTTL        time.Duration `yaml:"session_ttl"`
+	KeyMode           string        `yaml:"key_mode"`
+	UseCloudStats     bool          `yaml:"use_cloud_stats"`
+	CloudStatsTTL     time.Duration `yaml:"cloud_stats_ttl"`
 }
 
 // Defaults returns a safe initial configuration.
@@ -75,6 +81,8 @@ func Defaults() Config {
 		DefaultPoolSize:   DefaultPoolSize,
 		LunaPoolSize:      DefaultPoolSize,
 		SessionTTL:        DefaultSessionTTL,
+		KeyMode:           "single",
+		CloudStatsTTL:     60 * time.Second,
 	}
 }
 
@@ -97,6 +105,9 @@ func Parse(rawYAML []byte) (Config, error) {
 		DefaultPoolSize:   configuration.DefaultPoolSize,
 		LunaPoolSize:      configuration.LunaPoolSize,
 		SessionTTL:        configuration.SessionTTL,
+		KeyMode:           configuration.KeyMode,
+		UseCloudStats:     configuration.UseCloudStats,
+		CloudStatsTTL:     configuration.CloudStatsTTL,
 	}
 	decoder := yaml.NewDecoder(strings.NewReader(string(rawYAML)))
 	decoder.KnownFields(true)
@@ -117,6 +128,9 @@ func Parse(rawYAML []byte) (Config, error) {
 	configuration.DefaultPoolSize = decodedConfiguration.DefaultPoolSize
 	configuration.LunaPoolSize = decodedConfiguration.LunaPoolSize
 	configuration.SessionTTL = decodedConfiguration.SessionTTL
+	configuration.KeyMode = strings.ToLower(strings.TrimSpace(decodedConfiguration.KeyMode))
+	configuration.UseCloudStats = decodedConfiguration.UseCloudStats
+	configuration.CloudStatsTTL = decodedConfiguration.CloudStatsTTL
 
 	configuration.ProviderID = strings.TrimSpace(configuration.ProviderID)
 	if configuration.ProviderID == "" {
@@ -144,6 +158,12 @@ func Parse(rawYAML []byte) (Config, error) {
 	}
 	if configuration.SessionTTL <= 0 {
 		return Config{}, fmt.Errorf("session_ttl must be greater than zero")
+	}
+	if configuration.KeyMode != "single" && configuration.KeyMode != "pool" {
+		return Config{}, fmt.Errorf("key_mode must be single or pool")
+	}
+	if configuration.CloudStatsTTL <= 0 {
+		return Config{}, fmt.Errorf("cloud_stats_ttl must be greater than zero")
 	}
 	if configuration.StateDir != "" && !filepath.IsAbs(configuration.StateDir) {
 		return Config{}, fmt.Errorf("state_dir must be an absolute path")

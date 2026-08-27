@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mimmer/aihub-auto/cpa-plugin/internal/routing"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -374,6 +375,160 @@ func TestStreamExecutionRejectsResponseOverConfiguredLimit(t *testing.T) {
 	decodeEnvelope(t, dispatcher.Handle(pluginabi.MethodExecutorExecuteStream, rawRequest), &response)
 	if response.OK || response.Error.Code != "response_too_large" {
 		t.Fatalf("stream response = %#v, want bounded response error", response)
+	}
+}
+
+func TestStreamExecutionPushesChunksToHostBridge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		responseWriter.Header().Set("Content-Type", "text/event-stream")
+		_, _ = responseWriter.Write([]byte("data: one\n\n"))
+		if flusher, ok := responseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = responseWriter.Write([]byte("data: two\n\n"))
+		if flusher, ok := responseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+	dispatcher := configuredDispatcher(t, server.URL)
+	var emitted [][]byte
+	var closed bool
+	dispatcher.SetStreamEmitter(
+		func(_ context.Context, _ string, payload []byte, errorMessage string) error {
+			if errorMessage != "" {
+				t.Fatalf("unexpected emit error %q", errorMessage)
+			}
+			emitted = append(emitted, append([]byte(nil), payload...))
+			return nil
+		},
+		func(_ context.Context, _ string, _ string) error { closed = true; return nil },
+	)
+	rawRequest, _ := json.Marshal(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Format: "chat-completions", StorageJSON: []byte(`{"access_token":"access-token"}`), Payload: []byte(`{"model":"model-a"}`)},
+		StreamID:        "stream-1",
+	})
+	var response struct {
+		OK     bool           `json:"ok"`
+		Result streamResponse `json:"result"`
+	}
+	decodeEnvelope(t, dispatcher.Handle(pluginabi.MethodExecutorExecuteStream, rawRequest), &response)
+	if !response.OK || len(response.Result.Chunks) != 0 {
+		t.Fatalf("stream response = %#v, want immediate empty-chunk handoff", response)
+	}
+	// The pump goroutine forwards chunks asynchronously; wait for the close.
+	deadline := time.Now().Add(2 * time.Second)
+	for !closed && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !closed {
+		t.Fatal("host stream was not closed after upstream finished")
+	}
+	var joined []byte
+	for _, chunk := range emitted {
+		joined = append(joined, chunk...)
+	}
+	if string(joined) != "data: one\n\ndata: two\n\n" {
+		t.Fatalf("emitted chunks = %#v, want upstream SSE body", emitted)
+	}
+}
+
+func TestStreamExecutionEmitsErrorAndClosesOnOversize(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		responseWriter.Header().Set("Content-Type", "text/event-stream")
+		_, _ = responseWriter.Write([]byte("data: too-large\n\n"))
+	}))
+	defer server.Close()
+	dispatcher := configuredDispatcher(t, server.URL, "max_response_bytes: 4\n")
+	var emittedError string
+	var closed bool
+	dispatcher.SetStreamEmitter(
+		func(_ context.Context, _ string, _ []byte, errorMessage string) error { emittedError = errorMessage; return nil },
+		func(_ context.Context, _ string, _ string) error { closed = true; return nil },
+	)
+	rawRequest, _ := json.Marshal(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Format: "chat-completions", StorageJSON: []byte(`{"access_token":"access-token"}`), Payload: []byte(`{"model":"model-a"}`)},
+		StreamID:        "stream-1",
+	})
+	var response struct {
+		OK bool `json:"ok"`
+	}
+	decodeEnvelope(t, dispatcher.Handle(pluginabi.MethodExecutorExecuteStream, rawRequest), &response)
+	if !response.OK {
+		t.Fatalf("oversize stream handoff = %#v, want immediate ok", response)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !closed && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !closed || emittedError == "" {
+		t.Fatalf("oversize stream: closed=%t error=%q, want error emit and close", closed, emittedError)
+	}
+}
+
+func TestPoolModeExecutorUsesManagedKeyAsUpstreamBearer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/keys":
+			if request.Header.Get("Authorization") != "Bearer account-token" {
+				t.Fatalf("key create Authorization = %q, want account token", request.Header.Get("Authorization"))
+			}
+			_, _ = responseWriter.Write([]byte(`{"code":0,"data":{"id":"key-1","key":"sk-managed","group_id":3}}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/chat/completions":
+			if request.Header.Get("Authorization") != "Bearer sk-managed" {
+				t.Fatalf("executor Authorization = %q, want managed key material", request.Header.Get("Authorization"))
+			}
+			_, _ = responseWriter.Write([]byte(`{"id":"reply"}`))
+		default:
+			t.Fatalf("unexpected %s %s", request.Method, request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	dispatcher := configuredDispatcher(t, server.URL, "key_mode: pool\n")
+	rawRequest, _ := json.Marshal(pluginapi.ExecutorRequest{
+		Format:        "chat-completions",
+		StorageJSON:   []byte(`{"account_id":"account-a","access_token":"account-token"}`),
+		Payload:       []byte(`{"model":"model-a"}`),
+		AuthAttributes: map[string]string{
+			routing.AttributeAccountID: "account-a",
+			routing.AttributePlan:      "pro",
+			routing.AttributeGroupID:   "3",
+		},
+	})
+	var response struct {
+		OK     bool                       `json:"ok"`
+		Result pluginapi.ExecutorResponse `json:"result"`
+	}
+	decodeEnvelope(t, dispatcher.Handle(pluginabi.MethodExecutorExecute, rawRequest), &response)
+	if !response.OK || string(response.Result.Payload) != `{"id":"reply"}` {
+		t.Fatalf("pool executor response = %#v, want managed key execution", response)
+	}
+}
+
+func TestSingleModeExecutorUsesAccountTokenAsUpstreamBearer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(responseWriter http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected %s %s", request.Method, request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "Bearer account-token" {
+			t.Fatalf("executor Authorization = %q, want account token in single mode", request.Header.Get("Authorization"))
+		}
+		_, _ = responseWriter.Write([]byte(`{"id":"reply"}`))
+	}))
+	defer server.Close()
+	dispatcher := configuredDispatcher(t, server.URL)
+	rawRequest, _ := json.Marshal(pluginapi.ExecutorRequest{
+		Format:      "chat-completions",
+		StorageJSON: []byte(`{"account_id":"account-a","access_token":"account-token"}`),
+		Payload:     []byte(`{"model":"model-a"}`),
+	})
+	var response struct {
+		OK     bool                       `json:"ok"`
+		Result pluginapi.ExecutorResponse `json:"result"`
+	}
+	decodeEnvelope(t, dispatcher.Handle(pluginabi.MethodExecutorExecute, rawRequest), &response)
+	if !response.OK || string(response.Result.Payload) != `{"id":"reply"}` {
+		t.Fatalf("single executor response = %#v, want account token execution", response)
 	}
 }
 

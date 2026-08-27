@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,6 +87,60 @@ type Model struct {
 	ID          string
 	DisplayName string
 }
+type Key struct {
+	ID      string
+	Material string
+	GroupID int
+}
+
+// ProviderStat is a best-effort parse of one AIHub public provider entry. The
+// model_health and model_prices semantics are not yet confirmed, so every field
+// is optional and missing values fall back to conservative routing defaults.
+type ProviderStat struct {
+	GroupID       int
+	Available     bool
+	CacheHitRate  float64
+	ModelHealth   map[string]bool
+	ModelPrices   map[string]float64
+}
+
+// ProviderStats fetches the public provider catalog without authentication.
+func (client *Client) ProviderStats(ctx context.Context) ([]ProviderStat, error) {
+	var data []map[string]any
+	if err := client.json(ctx, http.MethodGet, "/api/v1/public/providers", "", nil, &data); err != nil {
+		return nil, err
+	}
+	stats := make([]ProviderStat, 0, len(data))
+	for _, record := range data {
+		groupID := intValue(record["group_id"])
+		if groupID <= 0 {
+			continue
+		}
+		stat := ProviderStat{GroupID: groupID, Available: true, ModelHealth: map[string]bool{}, ModelPrices: map[string]float64{}}
+		if available, ok := record["available"].(bool); ok {
+			stat.Available = available
+		}
+		if hitRate, ok := parsePercent(record["cache_hit_rate"]); ok {
+			stat.CacheHitRate = hitRate
+		}
+		if health, ok := record["model_health"].(map[string]any); ok {
+			for model, value := range health {
+				if healthy, ok := value.(bool); ok {
+					stat.ModelHealth[strings.ToLower(strings.TrimSpace(model))] = healthy
+				}
+			}
+		}
+		if prices, ok := record["model_prices"].(map[string]any); ok {
+			for model, value := range prices {
+				if price, ok := floatValue(value); ok {
+					stat.ModelPrices[strings.ToLower(strings.TrimSpace(model))] = price
+				}
+			}
+		}
+		stats = append(stats, stat)
+	}
+	return stats, nil
+}
 
 func (client *Client) Login(ctx context.Context, email, password string) (Session, error) {
 	var data map[string]any
@@ -135,6 +190,48 @@ func (client *Client) Models(ctx context.Context, token string) ([]Model, error)
 		}
 	}
 	return models, nil
+}
+
+// CreateKey creates a managed API key bound to a group and returns its plaintext
+// material. The material is the only secret and is never included in errors.
+func (client *Client) CreateKey(ctx context.Context, token, name string, groupID int) (Key, error) {
+	var data map[string]any
+	if err := client.json(ctx, http.MethodPost, "/api/v1/keys", token, map[string]any{"name": name, "group_id": groupID}, &data); err != nil {
+		return Key{}, err
+	}
+	key := Key{ID: stringValue(data["id"]), Material: stringValue(data["key"]), GroupID: intValue(data["group_id"])}
+	if key.ID == "" || key.Material == "" {
+		return Key{}, &Error{StatusCode: http.StatusOK, Operation: "key creation", Err: errors.New("invalid key response")}
+	}
+	return key, nil
+}
+
+// DeleteKey removes a managed API key by its remote identifier.
+func (client *Client) DeleteKey(ctx context.Context, token, keyID string) error {
+	var data map[string]any
+	return client.json(ctx, http.MethodDelete, "/api/v1/keys/"+keyID, token, nil, &data)
+}
+
+// KeyExists reports whether a managed API key still exists on the account.
+func (client *Client) KeyExists(ctx context.Context, token, keyID string) (bool, error) {
+	var data map[string]any
+	if err := client.json(ctx, http.MethodGet, "/api/v1/keys?page=1&page_size=1", token, nil, &data); err != nil {
+		return false, err
+	}
+	items, ok := data["items"].([]any)
+	if !ok {
+		return false, &Error{StatusCode: http.StatusOK, Operation: "key listing", Err: errors.New("invalid key list")}
+	}
+	for _, item := range items {
+		record, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringValue(record["id"]) == keyID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 func (client *Client) Execute(ctx context.Context, path, token string, headers http.Header, body []byte) (pluginapi.HTTPResponse, error) {
 	response, errRequest := client.do(ctx, http.MethodPost, path, token, headers, body, false)
@@ -344,6 +441,47 @@ func parseSession(data map[string]any) (Session, error) {
 func stringValue(value any) string {
 	stringResult, _ := value.(string)
 	return strings.TrimSpace(stringResult)
+}
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case string:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return parsed
+	}
+	return 0
+}
+func floatValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case string:
+		parsed, errParse := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return parsed, errParse == nil
+	}
+	return 0, false
+}
+func parsePercent(value any) (float64, bool) {
+	if raw, ok := value.(string); ok {
+		raw = strings.TrimSpace(raw)
+		if strings.HasSuffix(raw, "%") {
+			parsed, errParse := strconv.ParseFloat(strings.TrimSuffix(raw, "%"), 64)
+			if errParse == nil {
+				return parsed / 100, true
+			}
+		}
+	}
+	parsed, ok := floatValue(value)
+	return parsed, ok && parsed >= 0 && parsed <= 1
 }
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {

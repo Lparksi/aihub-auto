@@ -61,7 +61,20 @@ type SelectionOptions struct {
 	Observations     *ObservationStore
 	Breaker          *Breaker
 	EconomyPolicy    EconomyPolicy
+	CloudStats       *CloudStats
 	Now              time.Time
+}
+
+// CloudStats carries best-effort AIHub public provider metrics keyed by group.
+// Semantics are not yet confirmed, so every field is optional and missing
+// values fall back to the candidate's own attributes.
+type CloudStats struct {
+	// Health reports whether a group is healthy for a model. A group absent
+	// from the map is treated as healthy (conservative fallback).
+	Health map[int]map[string]bool
+	// Prices reports a group's per-model price. A group/model absent from the
+	// map falls back to the candidate's configured rate multiplier.
+	Prices map[int]map[string]float64
 }
 
 type RouteState struct {

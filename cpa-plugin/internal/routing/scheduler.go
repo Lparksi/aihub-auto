@@ -20,6 +20,7 @@ type Scheduler struct {
 	breaker      *Breaker
 	affinity     *sessions.Affinity
 	selected     map[string]Candidate
+	cloudStats   *CloudStats
 }
 
 func NewScheduler(mode Mode, priceBand PriceBand, manualLockID string) *Scheduler {
@@ -29,6 +30,14 @@ func NewScheduler(mode Mode, priceBand PriceBand, manualLockID string) *Schedule
 // NewSchedulerWithSessionTTL enables metadata-provided hashed session affinity.
 func NewSchedulerWithSessionTTL(mode Mode, priceBand PriceBand, manualLockID string, sessionTTL time.Duration) *Scheduler {
 	return &Scheduler{mode: mode, priceBand: priceBand, manualLockID: manualLockID, observations: NewObservationStore(), breaker: NewBreaker(BreakerOptions{}), affinity: sessions.New(sessionTTL), selected: map[string]Candidate{}}
+}
+
+// SetCloudStats installs best-effort AIHub public provider metrics used by
+// candidate scoring. A nil value disables cloud-aware routing.
+func (scheduler *Scheduler) SetCloudStats(stats *CloudStats) {
+	scheduler.mutex.Lock()
+	defer scheduler.mutex.Unlock()
+	scheduler.cloudStats = stats
 }
 
 func (scheduler *Scheduler) Pick(request pluginapi.SchedulerPickRequest, providerID string) pluginapi.SchedulerPickResponse {
@@ -55,7 +64,7 @@ func (scheduler *Scheduler) Pick(request pluginapi.SchedulerPickRequest, provide
 		if groupID, affinityOK := scheduler.affinity.Resolve(sessionKey, scope, request.Model, time.Now()); affinityOK {
 			for _, candidate := range candidates {
 				if candidate.Key.GroupID == groupID {
-					affineSelection := Select([]Candidate{candidate}, SelectionOptions{Mode: scheduler.mode, PriceBand: scheduler.priceBand, Model: request.Model, ManualLockAuthID: scheduler.manualLockID, Observations: scheduler.observations, Breaker: scheduler.breaker, Now: time.Now()})
+					affineSelection := Select([]Candidate{candidate}, SelectionOptions{Mode: scheduler.mode, PriceBand: scheduler.priceBand, Model: request.Model, ManualLockAuthID: scheduler.manualLockID, Observations: scheduler.observations, Breaker: scheduler.breaker, CloudStats: scheduler.cloudStats, Now: time.Now()})
 					if affineSelection.Candidate != nil {
 						scheduler.selected[affineSelection.Candidate.AuthID] = affineSelection.Candidate.Candidate
 						return pluginapi.SchedulerPickResponse{AuthID: affineSelection.Candidate.AuthID, Handled: true}
@@ -66,7 +75,7 @@ func (scheduler *Scheduler) Pick(request pluginapi.SchedulerPickRequest, provide
 			scheduler.affinity.Invalidate(sessionKey, scope, groupID)
 		}
 	}
-	selection := Select(candidates, SelectionOptions{Mode: scheduler.mode, PriceBand: scheduler.priceBand, Model: request.Model, ManualLockAuthID: scheduler.manualLockID, Observations: scheduler.observations, Breaker: scheduler.breaker, Now: time.Now()})
+	selection := Select(candidates, SelectionOptions{Mode: scheduler.mode, PriceBand: scheduler.priceBand, Model: request.Model, ManualLockAuthID: scheduler.manualLockID, Observations: scheduler.observations, Breaker: scheduler.breaker, CloudStats: scheduler.cloudStats, Now: time.Now()})
 	if selection.Candidate == nil {
 		return pluginapi.SchedulerPickResponse{}
 	}

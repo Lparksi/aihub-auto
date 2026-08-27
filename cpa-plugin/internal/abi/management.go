@@ -36,7 +36,7 @@ func (dispatcher *Dispatcher) managementStatus() pluginapi.ManagementResponse {
 			"provider_id": currentConfiguration.ProviderID, "base_url": currentConfiguration.BaseURL,
 			"mode": currentConfiguration.Mode, "price_band_min": currentConfiguration.PriceBandMin,
 			"price_band_max": currentConfiguration.PriceBandMax, "model_patterns": currentConfiguration.ModelPatterns,
-			"management_enabled": currentConfiguration.ManagementEnabled,
+			"management_enabled": currentConfiguration.ManagementEnabled, "key_mode": currentConfiguration.KeyMode,
 		},
 		"routing": map[string]any{"candidate_summary": "candidate details are supplied only by each scheduler request", "manual_lock_active": manualLockActive, "breaker": "in-memory", "observations": "in-memory"},
 		"pools": map[string]any{
@@ -45,8 +45,15 @@ func (dispatcher *Dispatcher) managementStatus() pluginapi.ManagementResponse {
 			"lifecycle_confirmed": lifecycleConfirmed,
 		},
 		"sessions":    map[string]int{"bindings": sessionCount, "aliases": aliasCount},
-		"diagnostics": map[string]any{"key_operations": "not available: AIHub lifecycle endpoint is unconfirmed", "state": stateDiagnostic},
+		"diagnostics": map[string]any{"key_operations": keyOperationsDiagnostic(lifecycleConfirmed), "state": stateDiagnostic},
 	})
+}
+
+func keyOperationsDiagnostic(lifecycleConfirmed bool) string {
+	if lifecycleConfirmed {
+		return "managed AIHub key pool active"
+	}
+	return "not available: AIHub key lifecycle is disabled (key_mode: single)"
 }
 
 func (dispatcher *Dispatcher) updateManagementConfiguration(rawRequest []byte) pluginapi.ManagementResponse {
@@ -61,7 +68,10 @@ func (dispatcher *Dispatcher) updateManagementConfiguration(rawRequest []byte) p
 		return managementJSONResponse(http.StatusBadRequest, map[string]string{"error": "invalid configuration"})
 	}
 	fallbackSnapshot := dispatcher.snapshotRuntimeState()
-	newScheduler, newPoolManager, newStore, newSnapshot := buildRuntime(parsedConfiguration, fallbackSnapshot)
+	dispatcher.mutex.RLock()
+	tokenStore, clientFactory := dispatcher.tokenStore, dispatcher.clientFactory
+	dispatcher.mutex.RUnlock()
+	newScheduler, newPoolManager, newStore, newSnapshot := buildRuntime(parsedConfiguration, fallbackSnapshot, tokenStore, clientFactory)
 
 	dispatcher.mutex.Lock()
 	previousConfiguration := dispatcher.configuration

@@ -99,6 +99,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	C.cliproxySetHostAPI(host)
 	dispatcher.SetHostHTTPClient(hostHTTPClient{})
 	dispatcher.SetAuthSaver(saveHostAuth)
+	dispatcher.SetStreamEmitter(emitHostStream, closeHostStream)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	C.cliproxySetPluginAPI(plugin)
 	return 0
@@ -186,6 +187,25 @@ func readHostStream(contextValue context.Context, streamID string, chunks chan<-
 
 func saveHostAuth(contextValue context.Context, name string, authJSON []byte) error {
 	_, errCall := callHost(contextValue, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{Name: name, JSON: authJSON})
+	return errCall
+}
+
+// emitHostStream pushes one executor stream chunk to CPA's host stream bridge.
+func emitHostStream(contextValue context.Context, streamID string, payload []byte, errorMessage string) error {
+	_, errCall := callHost(contextValue, pluginabi.MethodHostStreamEmit, struct {
+		StreamID string `json:"stream_id"`
+		Payload  []byte `json:"payload,omitempty"`
+		Error    string `json:"error,omitempty"`
+	}{StreamID: streamID, Payload: payload, Error: errorMessage})
+	return errCall
+}
+
+// closeHostStream terminates CPA's host stream bridge for one executor stream.
+func closeHostStream(contextValue context.Context, streamID string, errorMessage string) error {
+	_, errCall := callHost(contextValue, pluginabi.MethodHostStreamClose, struct {
+		StreamID string `json:"stream_id"`
+		Error    string `json:"error,omitempty"`
+	}{StreamID: streamID, Error: errorMessage})
 	return errCall
 }
 
