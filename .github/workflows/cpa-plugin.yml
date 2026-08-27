@@ -77,6 +77,9 @@ jobs:
       - name: Download Go modules
         working-directory: cpa-plugin
         run: go mod download
+      - name: Tidy modules against checked-out CPA main
+        working-directory: cpa-plugin
+        run: go mod tidy
       - name: Run real dynamic loader fixture
         working-directory: cpa-plugin
         run: go test -tags=cpa_dynamic_loader ./integration

@@ -18,9 +18,12 @@ import (
 // TestPluginLoadsThroughCPAPluginHost builds the native library and lets CPA's
 // public plugin host dlopen it. It deliberately makes no fake loader claim.
 func TestPluginLoadsThroughCPAPluginHost(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skipf("CPA public loader exposes dlopen only on darwin/linux, not %s", runtime.GOOS)
+	}
 	pluginRoot := pluginRootFromTestFile(t)
 	pluginDirectory := t.TempDir()
-	pluginPath := filepath.Join(pluginDirectory, "aihub-auto"+pluginhost.PluginExtension(runtime.GOOS))
+	pluginPath := filepath.Join(pluginDirectory, pluginLibraryName(runtime.GOOS))
 	buildCommand := exec.Command("go", "build", "-buildmode=c-shared", "-o", pluginPath, "./cmd/aihub-auto-plugin")
 	buildCommand.Dir = pluginRoot
 	buildCommand.Env = append(os.Environ(), "CGO_ENABLED=1")
@@ -89,4 +92,15 @@ func pluginRootFromTestFile(testingHandle *testing.T) string {
 		testingHandle.Fatal("locate integration test source")
 	}
 	return filepath.Dir(filepath.Dir(currentFile))
+}
+
+func pluginLibraryName(goos string) string {
+	switch goos {
+	case "darwin":
+		return "aihub-auto.dylib"
+	case "linux":
+		return "aihub-auto.so"
+	default:
+		return ""
+	}
 }
