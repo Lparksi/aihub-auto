@@ -9,3 +9,10 @@ artifacts/
 credentials.json
 dist-types/
 *.tgz
+
+# Go build artifacts
+*.exe
+*.out
+*.test
+/bin/
+/coverage.out
